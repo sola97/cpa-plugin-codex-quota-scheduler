@@ -10,23 +10,25 @@ import (
 type PickDecision struct {
 	AuthID          string
 	Handled         bool
+	Reject          bool
 	DelegateBuiltin string
 	Reason          string
 	Ordered         []ScheduledAccount
 }
 
 type ScheduledAccount struct {
-	AuthID            string
-	CPAPriority       int
-	SchedulerPriority int
-	Family            AccountFamily
-	QueueStatus       QueueStatus
-	Available         bool
-	UnavailableReason string
-	SortTime          time.Time
-	Annotation        AccountAnnotation
-	selectionClass    AvailabilityClass
-	selectionView     AccountView
+	AuthID                    string
+	CPAPriority               int
+	SchedulerPriority         int
+	Family                    AccountFamily
+	QueueStatus               QueueStatus
+	Available                 bool
+	UnavailableReason         string
+	WeeklyQuotaReserveBlocked bool
+	SortTime                  time.Time
+	Annotation                AccountAnnotation
+	selectionClass            AvailabilityClass
+	selectionView             AccountView
 }
 
 type QueueStatus string
@@ -94,6 +96,14 @@ func PickCodexAccount(req pluginapi.SchedulerPickRequest, snapshot StateSnapshot
 		}
 	}
 
+	if hasWeeklyQuotaReserveScheduledAccount(ordered) {
+		return PickDecision{
+			Handled: true,
+			Reject:  true,
+			Reason:  weeklyQuotaReserveReason,
+			Ordered: ordered,
+		}
+	}
 	if snapshot.Config.Fallback == FallbackFillFirst {
 		return PickDecision{
 			Handled:         true,
@@ -154,7 +164,7 @@ func buildOrderedAccounts(req pluginapi.SchedulerPickRequest, snapshot StateSnap
 			continue
 		}
 
-		queueStatus, available, reason, sortTime := accountQueueState(account, now)
+		queueStatus, available, reason, sortTime := accountQueueStateWithConfig(account, now, snapshot.Config)
 		view := accountViewFromState(account, snapshot.Config, now, trials)
 		selectionClass := ClassifyAccount(view, now)
 		if selectionClass == Excluded && available && view.Trial != TrialNone {
@@ -164,17 +174,18 @@ func buildOrderedAccounts(req pluginapi.SchedulerPickRequest, snapshot StateSnap
 			sortTime = time.Time{}
 		}
 		ordered = append(ordered, ScheduledAccount{
-			AuthID:            candidate.ID,
-			CPAPriority:       candidate.Priority,
-			SchedulerPriority: account.Annotation.SchedulerPriority,
-			Family:            account.Family,
-			QueueStatus:       queueStatus,
-			Available:         available,
-			UnavailableReason: reason,
-			SortTime:          sortTime,
-			Annotation:        account.Annotation,
-			selectionClass:    selectionClass,
-			selectionView:     view,
+			AuthID:                    candidate.ID,
+			CPAPriority:               candidate.Priority,
+			SchedulerPriority:         account.Annotation.SchedulerPriority,
+			Family:                    account.Family,
+			QueueStatus:               queueStatus,
+			Available:                 available,
+			UnavailableReason:         reason,
+			WeeklyQuotaReserveBlocked: weeklyQuotaReserveBlocks(account, snapshot.Config, now),
+			SortTime:                  sortTime,
+			Annotation:                account.Annotation,
+			selectionClass:            selectionClass,
+			selectionView:             view,
 		})
 	}
 
@@ -206,6 +217,10 @@ func accountAvailable(account AccountState, now time.Time) (bool, string) {
 }
 
 func accountQueueState(account AccountState, now time.Time) (QueueStatus, bool, string, time.Time) {
+	return accountQueueStateWithConfig(account, now, DefaultConfig())
+}
+
+func accountQueueStateWithConfig(account AccountState, now time.Time, cfg Config) (QueueStatus, bool, string, time.Time) {
 	if account.Refresh.AuthFailure {
 		return QueueStatusUnavailable, false, "auth_failure", time.Time{}
 	}
@@ -221,6 +236,9 @@ func accountQueueState(account AccountState, now time.Time) (QueueStatus, bool, 
 	}
 	if circuit.EffectiveState == CircuitStateClosed && circuit.FailureCount > 0 && !circuit.NextProbeAt.IsZero() && circuit.NextProbeAt.After(now) {
 		return QueueStatusUnavailable, false, "quota_probe_wait", circuit.NextProbeAt
+	}
+	if weeklyQuotaReserveBlocks(account, cfg, now) {
+		return QueueStatusUnavailable, false, weeklyQuotaReserveReason, weeklyQuotaReserveUnlockAt(account, cfg)
 	}
 	switch account.Family {
 	case AccountFamilyWeekly:
@@ -273,6 +291,15 @@ func accountQueueState(account AccountState, now time.Time) (QueueStatus, bool, 
 		}
 		return QueueStatusUnavailable, false, "unknown_family", time.Time{}
 	}
+}
+
+func hasWeeklyQuotaReserveScheduledAccount(accounts []ScheduledAccount) bool {
+	for _, account := range accounts {
+		if account.WeeklyQuotaReserveBlocked {
+			return true
+		}
+	}
+	return false
 }
 
 func requestIncludesCodex(req pluginapi.SchedulerPickRequest) bool {

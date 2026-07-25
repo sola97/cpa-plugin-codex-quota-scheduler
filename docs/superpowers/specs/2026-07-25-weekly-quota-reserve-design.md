@@ -2,20 +2,27 @@
 
 ## Goal
 
-Add a global scheduler setting that reserves part of every weekly Codex
-account's quota. The default reserve is `0%`, which preserves the current
-behavior. When configured to `20%`, a weekly account whose remaining weekly
-quota is below `20%` and whose reset-credit endpoint explicitly reports zero
-available reset credits must not be selected by the plugin scheduler.
+Add three global scheduler settings that reserve part of every weekly Codex
+account's quota: `enable_weekly_quota_reserve` (default `true`),
+`weekly_quota_reserve_percent` (default `20`), and
+`weekly_quota_reserve_unlock_window` (default `5h`). The switch disables the
+policy without changing the configured values. A weekly account whose
+remaining weekly quota is below the configured percentage and whose reset-credit
+endpoint explicitly reports zero available reset credits is held as reserve
+while its next weekly reset is farther away than the unlock window.
 
 ## Configuration
 
-Add `weekly_quota_reserve_percent` to the persisted plugin configuration and
-the Management UI settings form.
+Add the three reserve settings to the persisted plugin configuration and the
+Management UI settings form.
 
-- Default: `0`.
+- Defaults: enabled, `20%`, and `5h`.
 - Valid range: `0` through `100`.
-- `0` disables the policy.
+- The switch disables the policy. A percentage of `0` also results in no
+  account being held in reserve.
+- The unlock window must be a positive duration. When the next weekly reset is
+  less than this window away, the account is released and returns to normal
+  scheduling.
 - The comparison is strict: remaining quota equal to the configured value is
   still usable; only a lower value is blocked.
 - The setting is global and applies to all accounts classified as weekly.
@@ -39,7 +46,8 @@ Monthly accounts and accounts with the policy disabled are unaffected.
 The rule is dynamic. A later successful refresh that raises the remaining
 quota to the threshold or reports a positive reset-credit count makes the
 account eligible again without changing CPA's persisted account-disabled
-state.
+state. The account also becomes eligible automatically when the reset enters
+the unlock window, even before another refresh completes.
 
 ## Scheduler and fallback behavior
 
@@ -58,11 +66,11 @@ not the reason all candidates are unavailable.
 
 ## UI
 
-Place a numeric field in the existing `调度设置` panel with a concise Chinese
-description explaining that it is the weekly quota reserve percentage and
-that `0` disables the rule. The account card uses the existing unavailable
-reason presentation with a dedicated reason key for accounts blocked by the
-policy.
+Place an enable switch, percentage field, and duration field in the existing
+`调度设置` panel. The account card uses the existing unavailable reason
+presentation with a dedicated reason key for accounts held by the policy and
+shows the calculated unlock time. When the account is inside the unlock window,
+the card reports that the reserve has been released and shows the next reset.
 
 ## Verification
 
@@ -71,6 +79,7 @@ Add focused tests for:
 - default and boundary configuration validation;
 - weekly remaining quota below, equal to, and above the threshold;
 - zero, positive, and unknown reset-credit counts;
+- unlock-window release before the next refresh;
 - monthly-account exclusion;
 - automatic re-admission after refreshed quota data changes;
 - Management status reason and UI setting wiring;

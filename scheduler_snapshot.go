@@ -85,6 +85,9 @@ func schedulerPickPublished(req pluginapi.SchedulerPickRequest, now time.Time) P
 	if result.AuthID != "" {
 		return observeSchedulerDecision(snapshot, req, PickDecision{AuthID: result.AuthID, Handled: true, Reason: "selected"}, now)
 	}
+	if hasWeeklyQuotaReserveCandidate(*snapshot, candidates, now) {
+		return observeSchedulerDecision(snapshot, req, PickDecision{Handled: true, Reject: true, Reason: weeklyQuotaReserveReason}, now)
+	}
 	if snapshot.Fallback == FallbackFillFirst {
 		return observeSchedulerDecision(snapshot, req, PickDecision{Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinFillFirst, Reason: result.Reason}, now)
 	}
@@ -139,9 +142,28 @@ func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *Tri
 		PluginPriority: a.Annotation.SchedulerPriority, Family: a.Family,
 		Cache: cache, LastKnownAvailable: a.LastError == "", Exhausted: exhausted,
 		ResetAt: reset, AuthBlocked: a.Refresh.AuthFailure, Circuit: circuitClass,
-		TemporaryUnavailable: a.TemporaryExhausted && a.TemporaryResetAt.After(now),
-		Trial:                trial, Expiry: accountSortTime(a), RemainingQuota: remainingQuota(a),
+		TemporaryUnavailable:       a.TemporaryExhausted && a.TemporaryResetAt.After(now),
+		WeeklyQuotaReserveBlocked:  weeklyQuotaReserveBlocks(a, cfg, now),
+		WeeklyQuotaReserveUnlockAt: weeklyQuotaReserveUnlockAt(a, cfg),
+		Trial:                      trial, Expiry: accountSortTime(a), RemainingQuota: remainingQuota(a),
 	}
+}
+
+func hasWeeklyQuotaReserveCandidate(snapshot SchedulerSnapshot, candidates []Candidate, now time.Time) bool {
+	eligible := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.ID != "" && candidate.Provider == "codex" {
+			if _, ok := snapshot.ActiveHighestTier[candidate.ID]; ok {
+				eligible[candidate.ID] = struct{}{}
+			}
+		}
+	}
+	for _, account := range snapshot.Accounts {
+		if _, ok := eligible[account.ID]; ok && account.WeeklyQuotaReserveBlocked && (account.WeeklyQuotaReserveUnlockAt.IsZero() || account.WeeklyQuotaReserveUnlockAt.After(now)) {
+			return true
+		}
+	}
+	return false
 }
 
 func publishSchedulerState(state *PluginState, active map[string]struct{}, now time.Time) {

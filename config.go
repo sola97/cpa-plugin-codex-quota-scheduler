@@ -38,6 +38,9 @@ type Config struct {
 	EnableUsageFeedback             bool
 	EnableResetProbe                bool
 	ProbeOnProvisionalRoster        bool
+	EnableWeeklyQuotaReserve        bool
+	WeeklyQuotaReservePercent       float64
+	WeeklyQuotaReserveUnlockWindow  time.Duration
 	MaxRefreshConcurrency           int
 	QuotaEndpoint                   string
 	RefreshActiveWindow             time.Duration
@@ -64,25 +67,28 @@ type registrationCapabilities struct {
 }
 
 type rawConfig struct {
-	HandleEnabled                   *bool  `yaml:"handle_enabled"`
-	QuotaRefreshInterval            string `yaml:"quota_refresh_interval"`
-	StaleAfter                      string `yaml:"stale_after"`
-	MonthlyMode                     string `yaml:"monthly_mode"`
-	Fallback                        string `yaml:"fallback"`
-	EnableUsageFeedback             *bool  `yaml:"enable_usage_feedback"`
-	EnableResetProbe                *bool  `yaml:"enable_reset_probe"`
-	ProbeOnProvisionalRoster        *bool  `yaml:"probe_on_provisional_roster"`
-	MaxRefreshConcurrency           *int   `yaml:"max_refresh_concurrency"`
-	QuotaEndpoint                   string `yaml:"quota_endpoint"`
-	RefreshActiveWindow             string `yaml:"refresh_active_window"`
-	RefreshAfterResetDelay          string `yaml:"refresh_after_reset_delay"`
-	RefreshRetryDelays              string `yaml:"refresh_retry_delays"`
-	RefreshOnStartup                *bool  `yaml:"refresh_on_startup"`
-	CircuitFailureThreshold         *int   `yaml:"circuit_failure_threshold"`
-	CircuitOpenDuration             string `yaml:"circuit_open_duration"`
-	CircuitHalfOpenSuccessThreshold *int   `yaml:"circuit_half_open_success_threshold"`
-	MaxLogEntries                   *int   `yaml:"max_log_entries"`
-	LogRetention                    string `yaml:"log_retention"`
+	HandleEnabled                   *bool    `yaml:"handle_enabled"`
+	QuotaRefreshInterval            string   `yaml:"quota_refresh_interval"`
+	StaleAfter                      string   `yaml:"stale_after"`
+	MonthlyMode                     string   `yaml:"monthly_mode"`
+	Fallback                        string   `yaml:"fallback"`
+	EnableUsageFeedback             *bool    `yaml:"enable_usage_feedback"`
+	EnableResetProbe                *bool    `yaml:"enable_reset_probe"`
+	ProbeOnProvisionalRoster        *bool    `yaml:"probe_on_provisional_roster"`
+	EnableWeeklyQuotaReserve        *bool    `yaml:"enable_weekly_quota_reserve"`
+	WeeklyQuotaReservePercent       *float64 `yaml:"weekly_quota_reserve_percent"`
+	WeeklyQuotaReserveUnlockWindow  string   `yaml:"weekly_quota_reserve_unlock_window"`
+	MaxRefreshConcurrency           *int     `yaml:"max_refresh_concurrency"`
+	QuotaEndpoint                   string   `yaml:"quota_endpoint"`
+	RefreshActiveWindow             string   `yaml:"refresh_active_window"`
+	RefreshAfterResetDelay          string   `yaml:"refresh_after_reset_delay"`
+	RefreshRetryDelays              string   `yaml:"refresh_retry_delays"`
+	RefreshOnStartup                *bool    `yaml:"refresh_on_startup"`
+	CircuitFailureThreshold         *int     `yaml:"circuit_failure_threshold"`
+	CircuitOpenDuration             string   `yaml:"circuit_open_duration"`
+	CircuitHalfOpenSuccessThreshold *int     `yaml:"circuit_half_open_success_threshold"`
+	MaxLogEntries                   *int     `yaml:"max_log_entries"`
+	LogRetention                    string   `yaml:"log_retention"`
 }
 
 func DefaultConfig() Config {
@@ -94,6 +100,9 @@ func DefaultConfig() Config {
 		Fallback:                        FallbackFillFirst,
 		EnableUsageFeedback:             true,
 		EnableResetProbe:                false,
+		EnableWeeklyQuotaReserve:        true,
+		WeeklyQuotaReservePercent:       20,
+		WeeklyQuotaReserveUnlockWindow:  5 * time.Hour,
 		MaxRefreshConcurrency:           1,
 		QuotaEndpoint:                   chatGPTQuotaEndpoint,
 		RefreshActiveWindow:             time.Hour,
@@ -121,6 +130,12 @@ func NormalizeConfig(cfg Config) Config {
 	}
 	if cfg.Fallback == "" {
 		cfg.Fallback = defaults.Fallback
+	}
+	if cfg.WeeklyQuotaReservePercent < 0 || cfg.WeeklyQuotaReservePercent > 100 {
+		cfg.WeeklyQuotaReservePercent = defaults.WeeklyQuotaReservePercent
+	}
+	if cfg.WeeklyQuotaReserveUnlockWindow <= 0 {
+		cfg.WeeklyQuotaReserveUnlockWindow = defaults.WeeklyQuotaReserveUnlockWindow
 	}
 	if cfg.MaxRefreshConcurrency <= 0 {
 		cfg.MaxRefreshConcurrency = defaults.MaxRefreshConcurrency
@@ -206,6 +221,25 @@ func DecodeConfig(raw []byte) (Config, error) {
 	}
 	if decoded.ProbeOnProvisionalRoster != nil {
 		cfg.ProbeOnProvisionalRoster = *decoded.ProbeOnProvisionalRoster
+	}
+	if decoded.EnableWeeklyQuotaReserve != nil {
+		cfg.EnableWeeklyQuotaReserve = *decoded.EnableWeeklyQuotaReserve
+	}
+	if decoded.WeeklyQuotaReservePercent != nil {
+		if *decoded.WeeklyQuotaReservePercent < 0 || *decoded.WeeklyQuotaReservePercent > 100 {
+			return Config{}, fmt.Errorf("weekly_quota_reserve_percent must be between 0 and 100")
+		}
+		cfg.WeeklyQuotaReservePercent = *decoded.WeeklyQuotaReservePercent
+	}
+	if decoded.WeeklyQuotaReserveUnlockWindow != "" {
+		d, err := time.ParseDuration(decoded.WeeklyQuotaReserveUnlockWindow)
+		if err != nil {
+			return Config{}, fmt.Errorf("weekly_quota_reserve_unlock_window: %w", err)
+		}
+		if d <= 0 {
+			return Config{}, fmt.Errorf("weekly_quota_reserve_unlock_window must be positive")
+		}
+		cfg.WeeklyQuotaReserveUnlockWindow = d
 	}
 	if decoded.MaxRefreshConcurrency != nil {
 		if *decoded.MaxRefreshConcurrency <= 0 {

@@ -113,6 +113,9 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		}
 	}
 	decision := schedulerPickPublished(req, time.Now())
+	if decision.Reject {
+		return nil, fmt.Errorf("scheduler rejected request: %s", decision.Reason)
+	}
 	return okEnvelope(pluginapi.SchedulerPickResponse{
 		AuthID:          decision.AuthID,
 		DelegateBuiltin: decision.DelegateBuiltin,
@@ -147,6 +150,11 @@ func logSchedulerDecision(store *PluginState, req pluginapi.SchedulerPickRequest
 			fields["selected_cpa_priority"] = selected.CPAPriority
 			fields["selected_scheduler_priority"] = selected.SchedulerPriority
 		}
+	} else if decision.Reject {
+		event = "scheduler.rejected"
+		message = "插件拒绝使用当前储备额度账号"
+		level = "warn"
+		fields["unavailable_summary"] = unavailableSummary(decision.Ordered)
 	} else if decision.DelegateBuiltin != "" {
 		event = "scheduler.fallback"
 		message = "插件触发内置调度 fallback"

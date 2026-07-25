@@ -131,6 +131,9 @@ refresh_on_startup: false
 monthly_mode: expiry_order
 fallback: fill-first
 enable_usage_feedback: true
+enable_weekly_quota_reserve: true
+weekly_quota_reserve_percent: 20
+weekly_quota_reserve_unlock_window: 5h
 max_refresh_concurrency: 1
 quota_endpoint: https://chatgpt.com/backend-api/wham/usage
 circuit_failure_threshold: 5
@@ -146,6 +149,12 @@ log_retention: 24h
   within the same CPA priority tier.
 - `priority`: prefer monthly accounts before weekly accounts within the same CPA
   priority tier.
+
+When `enable_weekly_quota_reserve` is enabled, weekly accounts whose remaining
+quota is strictly below `weekly_quota_reserve_percent` and whose available reset
+credit count is exactly zero are held in reserve. They are released again when
+the next weekly reset is less than `weekly_quota_reserve_unlock_window` away. Missing
+reset-credit data does not trigger the reserve policy.
 
 While the scheduler is inside `refresh_active_window`,
 `quota_refresh_interval` is the normal per-account refresh cadence. The worker

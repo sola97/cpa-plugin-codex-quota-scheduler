@@ -39,21 +39,23 @@ const (
 )
 
 type AccountView struct {
-	ID                   string
-	AuthIndex            string
-	Instance             AuthInstanceID
-	PluginPriority       int
-	Family               AccountFamily
-	Cache                CacheClass
-	LastKnownAvailable   bool
-	Exhausted            bool
-	ResetAt              time.Time
-	AuthBlocked          bool
-	Circuit              CircuitClass
-	TemporaryUnavailable bool
-	Trial                TrialState
-	Expiry               time.Time
-	RemainingQuota       float64
+	ID                         string
+	AuthIndex                  string
+	Instance                   AuthInstanceID
+	PluginPriority             int
+	Family                     AccountFamily
+	Cache                      CacheClass
+	LastKnownAvailable         bool
+	Exhausted                  bool
+	ResetAt                    time.Time
+	AuthBlocked                bool
+	Circuit                    CircuitClass
+	TemporaryUnavailable       bool
+	WeeklyQuotaReserveBlocked  bool
+	WeeklyQuotaReserveUnlockAt time.Time
+	Trial                      TrialState
+	Expiry                     time.Time
+	RemainingQuota             float64
 }
 
 type Candidate struct{ ID, Provider string }
@@ -70,7 +72,7 @@ type SelectionResult struct {
 }
 
 func ClassifyAccount(a AccountView, now time.Time) AvailabilityClass {
-	if a.AuthBlocked || a.Circuit == CircuitOpen || a.TemporaryUnavailable || a.Trial != TrialNone {
+	if a.AuthBlocked || a.Circuit == CircuitOpen || a.TemporaryUnavailable || a.Trial != TrialNone || (a.WeeklyQuotaReserveBlocked && (a.WeeklyQuotaReserveUnlockAt.IsZero() || a.WeeklyQuotaReserveUnlockAt.After(now))) {
 		return Excluded
 	}
 	if a.Exhausted && a.ResetAt.After(now) {
