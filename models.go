@@ -107,11 +107,18 @@ type ResetProbeState struct {
 }
 
 type AccountAnnotation struct {
-	Alias             string   `json:"alias,omitempty" yaml:"alias,omitempty"`
-	Notes             string   `json:"notes,omitempty" yaml:"notes,omitempty"`
-	Tags              []string `json:"tags,omitempty" yaml:"tags,omitempty"`
-	GroupID           string   `json:"group_id,omitempty" yaml:"group_id,omitempty"`
-	SchedulerPriority int      `json:"scheduler_priority,omitempty" yaml:"scheduler_priority,omitempty"`
+	Alias              string                    `json:"alias,omitempty" yaml:"alias,omitempty"`
+	Notes              string                    `json:"notes,omitempty" yaml:"notes,omitempty"`
+	Tags               []string                  `json:"tags,omitempty" yaml:"tags,omitempty"`
+	GroupID            string                    `json:"group_id,omitempty" yaml:"group_id,omitempty"`
+	SchedulerPriority  int                       `json:"scheduler_priority,omitempty" yaml:"scheduler_priority,omitempty"`
+	WeeklyQuotaReserve *WeeklyQuotaReservePolicy `json:"weekly_quota_reserve,omitempty" yaml:"weekly_quota_reserve,omitempty"`
+}
+
+type WeeklyQuotaReservePolicy struct {
+	Enabled     bool    `json:"enabled" yaml:"enabled"`
+	Percent     float64 `json:"percent" yaml:"percent"`
+	UnlockHours float64 `json:"unlock_hours" yaml:"unlock_hours"`
 }
 
 type GroupAnnotation struct {

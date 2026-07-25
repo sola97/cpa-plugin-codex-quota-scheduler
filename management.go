@@ -87,9 +87,6 @@ type SettingsPayload struct {
 	EnableUsageFeedback             bool        `json:"enable_usage_feedback"`
 	EnableResetProbe                bool        `json:"enable_reset_probe"`
 	ProbeOnProvisionalRoster        bool        `json:"probe_on_provisional_roster"`
-	EnableWeeklyQuotaReserve        bool        `json:"enable_weekly_quota_reserve"`
-	WeeklyQuotaReservePercent       float64     `json:"weekly_quota_reserve_percent"`
-	WeeklyQuotaReserveUnlockWindow  string      `json:"weekly_quota_reserve_unlock_window"`
 	MaxRefreshConcurrency           int         `json:"max_refresh_concurrency"`
 	QuotaEndpoint                   string      `json:"quota_endpoint"`
 	RefreshActiveWindow             string      `json:"refresh_active_window"`
@@ -104,36 +101,43 @@ type SettingsPayload struct {
 }
 
 type StatusAccount struct {
-	Rank                         int                `json:"rank"`
-	AuthID                       string             `json:"auth_id"`
-	Alias                        string             `json:"alias,omitempty"`
-	Notes                        string             `json:"notes,omitempty"`
-	GroupID                      string             `json:"group_id,omitempty"`
-	Group                        string             `json:"group,omitempty"`
-	GroupNotes                   string             `json:"group_notes,omitempty"`
-	Tags                         []string           `json:"tags,omitempty"`
-	CPAPriority                  int                `json:"cpa_priority"`
-	SchedulerPriority            int                `json:"scheduler_priority"`
-	Family                       AccountFamily      `json:"family"`
-	QueueStatus                  QueueStatus        `json:"queue_status"`
-	Available                    bool               `json:"available"`
-	UnavailableReason            string             `json:"unavailable_reason,omitempty"`
-	ResetExpiry                  time.Time          `json:"reset_expiry,omitempty"`
-	ResetExpiryText              string             `json:"reset_expiry_text,omitempty"`
-	CacheAge                     string             `json:"cache_age,omitempty"`
-	CacheAgeSeconds              int64              `json:"cache_age_seconds,omitempty"`
-	LastError                    string             `json:"last_error,omitempty"`
-	RefreshDueReason             string             `json:"refresh_due_reason,omitempty"`
-	NextRetryText                string             `json:"next_retry_text,omitempty"`
-	AuthFailure                  bool               `json:"auth_failure"`
-	StatusNote                   string             `json:"status_note,omitempty"`
-	FiveHour                     StatusWindow       `json:"five_hour"`
-	LongWindow                   StatusWindow       `json:"long_window"`
-	Circuit                      StatusCircuit      `json:"circuit"`
-	ResetCreditsAvailableCount   *int               `json:"reset_credits_available_count,omitempty"`
-	ResetCreditsTotalEarnedCount *int               `json:"reset_credits_total_earned_count,omitempty"`
-	ResetCredits                 []ResetCredit      `json:"reset_credits,omitempty"`
-	ResetProbes                  []StatusResetProbe `json:"reset_probes,omitempty"`
+	Rank                         int                       `json:"rank"`
+	AuthID                       string                    `json:"auth_id"`
+	Alias                        string                    `json:"alias,omitempty"`
+	Notes                        string                    `json:"notes,omitempty"`
+	GroupID                      string                    `json:"group_id,omitempty"`
+	Group                        string                    `json:"group,omitempty"`
+	GroupNotes                   string                    `json:"group_notes,omitempty"`
+	Tags                         []string                  `json:"tags,omitempty"`
+	CPAPriority                  int                       `json:"cpa_priority"`
+	SchedulerPriority            int                       `json:"scheduler_priority"`
+	Family                       AccountFamily             `json:"family"`
+	QueueStatus                  QueueStatus               `json:"queue_status"`
+	Available                    bool                      `json:"available"`
+	UnavailableReason            string                    `json:"unavailable_reason,omitempty"`
+	ResetExpiry                  time.Time                 `json:"reset_expiry,omitempty"`
+	ResetExpiryText              string                    `json:"reset_expiry_text,omitempty"`
+	CacheAge                     string                    `json:"cache_age,omitempty"`
+	CacheAgeSeconds              int64                     `json:"cache_age_seconds,omitempty"`
+	LastError                    string                    `json:"last_error,omitempty"`
+	RefreshDueReason             string                    `json:"refresh_due_reason,omitempty"`
+	NextRetryText                string                    `json:"next_retry_text,omitempty"`
+	AuthFailure                  bool                      `json:"auth_failure"`
+	StatusNote                   string                    `json:"status_note,omitempty"`
+	FiveHour                     StatusWindow              `json:"five_hour"`
+	LongWindow                   StatusWindow              `json:"long_window"`
+	Circuit                      StatusCircuit             `json:"circuit"`
+	ResetCreditsAvailableCount   *int                      `json:"reset_credits_available_count,omitempty"`
+	ResetCreditsTotalEarnedCount *int                      `json:"reset_credits_total_earned_count,omitempty"`
+	ResetCredits                 []ResetCredit             `json:"reset_credits,omitempty"`
+	ResetProbes                  []StatusResetProbe        `json:"reset_probes,omitempty"`
+	WeeklyQuotaReserve           WeeklyQuotaReservePayload `json:"weekly_quota_reserve"`
+}
+
+type WeeklyQuotaReservePayload struct {
+	Enabled     bool    `json:"enabled"`
+	Percent     float64 `json:"percent"`
+	UnlockHours float64 `json:"unlock_hours"`
 }
 
 type StatusResetProbe struct {
@@ -247,7 +251,7 @@ func handleManagementRequest(store *PluginState, req pluginapi.ManagementRequest
 	case method == http.MethodGet && path == "/annotations":
 		return jsonManagementResponse(http.StatusOK, store.Annotations())
 	case method == http.MethodPut && path == "/annotations":
-		return handlePutAnnotations(store, req)
+		return handlePutAnnotations(store, req, now)
 	case method == http.MethodPatch && path == "/annotations/account":
 		return handlePatchAccountAnnotation(store, req, now)
 	case method == http.MethodPatch && path == "/annotations/group":
@@ -309,9 +313,6 @@ func SettingsFromConfig(cfg Config) SettingsPayload {
 		EnableUsageFeedback:             cfg.EnableUsageFeedback,
 		EnableResetProbe:                cfg.EnableResetProbe,
 		ProbeOnProvisionalRoster:        cfg.ProbeOnProvisionalRoster,
-		EnableWeeklyQuotaReserve:        cfg.EnableWeeklyQuotaReserve,
-		WeeklyQuotaReservePercent:       cfg.WeeklyQuotaReservePercent,
-		WeeklyQuotaReserveUnlockWindow:  cfg.WeeklyQuotaReserveUnlockWindow.String(),
 		MaxRefreshConcurrency:           cfg.MaxRefreshConcurrency,
 		QuotaEndpoint:                   cfg.QuotaEndpoint,
 		RefreshActiveWindow:             cfg.RefreshActiveWindow.String(),
@@ -352,18 +353,6 @@ func ConfigFromSettings(base Config, payload SettingsPayload) (Config, error) {
 	cfg.EnableUsageFeedback = payload.EnableUsageFeedback
 	cfg.EnableResetProbe = payload.EnableResetProbe
 	cfg.ProbeOnProvisionalRoster = payload.ProbeOnProvisionalRoster
-	cfg.EnableWeeklyQuotaReserve = payload.EnableWeeklyQuotaReserve
-	if payload.WeeklyQuotaReservePercent < 0 || payload.WeeklyQuotaReservePercent > 100 {
-		return Config{}, jsonError("weekly_quota_reserve_percent must be between 0 and 100")
-	}
-	cfg.WeeklyQuotaReservePercent = payload.WeeklyQuotaReservePercent
-	if payload.WeeklyQuotaReserveUnlockWindow != "" {
-		d, err := time.ParseDuration(payload.WeeklyQuotaReserveUnlockWindow)
-		if err != nil || d <= 0 {
-			return Config{}, jsonError("weekly_quota_reserve_unlock_window must be a positive duration")
-		}
-		cfg.WeeklyQuotaReserveUnlockWindow = d
-	}
 	if payload.MaxRefreshConcurrency <= 0 {
 		return Config{}, jsonError("max_refresh_concurrency must be positive")
 	}
@@ -442,14 +431,14 @@ func handlePutSettings(store *PluginState, req pluginapi.ManagementRequest, now 
 	if err := json.Unmarshal(req.Body, &payload); err != nil {
 		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
-	resp := saveSettingsPayload(store, payload)
+	resp := saveSettingsPayload(store, payload, now)
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		store.RecordLog("info", "ui.settings_saved", "页面保存调度设置", nil, now)
 	}
 	return resp
 }
 
-func saveSettingsPayload(store *PluginState, payload SettingsPayload) pluginapi.ManagementResponse {
+func saveSettingsPayload(store *PluginState, payload SettingsPayload, now time.Time) pluginapi.ManagementResponse {
 	previousRisk := store.Config().ProbeOnProvisionalRoster
 	cfg, err := ConfigFromSettings(store.Config(), payload)
 	if err != nil {
@@ -462,6 +451,7 @@ func saveSettingsPayload(store *PluginState, payload SettingsPayload) pluginapi.
 	}
 	store.ReplaceConfig(cfg)
 	currentConfig.Store(cfg)
+	publishSchedulerState(store, nil, now)
 	if cfg.ProbeOnProvisionalRoster != previousRisk {
 		managementProvisionalRiskChanged(cfg.ProbeOnProvisionalRoster)
 	}
@@ -513,12 +503,16 @@ func handleImportState(store *PluginState, body []byte, now time.Time) pluginapi
 		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 	state = normalizePluginDiskState(state)
+	if err := validateAnnotationState(AnnotationState{Accounts: state.Accounts, Groups: state.Groups}); err != nil {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
 	if err := SaveUserData(semanticStatePaths(defaultStatePath()).UserData, state); err != nil {
 		return jsonManagementResponse(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 	store.ReplaceConfig(state.Config)
 	currentConfig.Store(state.Config)
 	store.SetAnnotations(AnnotationState{Accounts: state.Accounts, Groups: state.Groups})
+	publishSchedulerState(store, nil, now)
 	store.RecordLog("info", "ui.config_imported", "页面导入插件配置", nil, now)
 	return jsonManagementResponse(http.StatusOK, map[string]bool{"ok": true})
 }
@@ -604,11 +598,17 @@ func buildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount, life
 			FiveHour:          statusWindow(account.Quota.FiveHour, "5 小时额度"),
 			LongWindow:        statusWindow(account.Quota.LongWindow, longWindowLabelCN(account.Family)),
 		}
+		reserve := weeklyQuotaReserveState(account, snapshot.Now)
+		status.WeeklyQuotaReserve = WeeklyQuotaReservePayload{
+			Enabled:     reserve.Policy.Enabled,
+			Percent:     reserve.Policy.Percent,
+			UnlockHours: reserve.Policy.UnlockHours,
+		}
 		_, status.RefreshDueReason = accountRefreshDue(account, snapshot.Config, snapshot.Now)
 		status.StatusNote = accountStatusNote(account, status.RefreshDueReason, snapshot, payload.RefreshActive)
-		if weeklyQuotaReserveBlocks(account, snapshot.Config, snapshot.Now) {
-			status.StatusNote = fmt.Sprintf("周额度储备，预计 %s 解封。", formatTime(weeklyQuotaReserveUnlockAt(account, snapshot.Config)))
-		} else if weeklyQuotaReserveNearUnlock(account, snapshot.Config, snapshot.Now) {
+		if reserve.Blocked {
+			status.StatusNote = fmt.Sprintf("周额度储备，当前剩余 %.1f%%，低于保留额度 %.1f%%，预计 %s 解封。", reserve.RemainingPercent, reserve.Policy.Percent, formatTime(reserve.UnlockAt))
+		} else if reserve.Applies {
 			status.StatusNote = fmt.Sprintf("周额度储备已解封，预计 %s 重置。", formatTime(account.Quota.LongWindow.ResetAt))
 		}
 		status.Circuit = statusCircuit(account.Circuit, snapshot.Now)
@@ -1028,16 +1028,20 @@ func syntheticStatusRequest(snapshot StateSnapshot) pluginapi.SchedulerPickReque
 	}
 }
 
-func handlePutAnnotations(store *PluginState, req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+func handlePutAnnotations(store *PluginState, req pluginapi.ManagementRequest, now time.Time) pluginapi.ManagementResponse {
 	var state AnnotationState
 	if err := json.Unmarshal(req.Body, &state); err != nil {
 		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 	state = NormalizeAnnotationState(state)
+	if err := validateAnnotationState(state); err != nil {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
 	if err := persistAnnotationState(store, state); err != nil {
 		return jsonManagementResponse(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 	store.SetAnnotations(state)
+	publishSchedulerState(store, nil, now)
 	return jsonManagementResponse(http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -1048,6 +1052,7 @@ func handlePatchAccountAnnotation(store *PluginState, req pluginapi.ManagementRe
 	}
 	resp := applyAccountAnnotationPatch(store, patch)
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		publishSchedulerState(store, nil, now)
 		store.RecordLog("info", "ui.account_saved", "页面保存账号卡片", map[string]any{"auth_id": patch.AuthID, "key": patch.Key}, now)
 	}
 	return resp
@@ -1055,6 +1060,9 @@ func handlePatchAccountAnnotation(store *PluginState, req pluginapi.ManagementRe
 
 func applyAccountAnnotationPatch(store *PluginState, patch annotationPatch) pluginapi.ManagementResponse {
 	key := patch.accountKey()
+	if patch.Key == "" && patch.ID == "" && patch.AuthID != "" {
+		key = store.AnnotationKeyForAuthID(patch.AuthID)
+	}
 	if key == "" {
 		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": "annotation key is required"})
 	}
@@ -1080,6 +1088,13 @@ func applyAccountAnnotationPatch(store *PluginState, patch annotationPatch) plug
 	}
 	if patch.SchedulerPriority != nil {
 		annotation.SchedulerPriority = *patch.SchedulerPriority
+	}
+	if patch.WeeklyQuotaReserve != nil {
+		policy := *patch.WeeklyQuotaReserve
+		annotation.WeeklyQuotaReserve = &policy
+	}
+	if err := validateAccountAnnotation(annotation); err != nil {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 	state.Accounts[key] = annotation
 	state = NormalizeAnnotationState(state)
@@ -1137,17 +1152,18 @@ func applyGroupAnnotationPatch(store *PluginState, patch annotationPatch) plugin
 }
 
 type annotationPatch struct {
-	Key               string          `json:"key"`
-	ID                string          `json:"id"`
-	AuthID            string          `json:"auth_id"`
-	Alias             *string         `json:"alias"`
-	Name              *string         `json:"name"`
-	Notes             *string         `json:"notes"`
-	Tags              []string        `json:"tags"`
-	GroupID           *string         `json:"group_id"`
-	SchedulerPriority *int            `json:"scheduler_priority"`
-	Color             *string         `json:"color"`
-	Annotation        json.RawMessage `json:"annotation"`
+	Key                string                    `json:"key"`
+	ID                 string                    `json:"id"`
+	AuthID             string                    `json:"auth_id"`
+	Alias              *string                   `json:"alias"`
+	Name               *string                   `json:"name"`
+	Notes              *string                   `json:"notes"`
+	Tags               []string                  `json:"tags"`
+	GroupID            *string                   `json:"group_id"`
+	SchedulerPriority  *int                      `json:"scheduler_priority"`
+	WeeklyQuotaReserve *WeeklyQuotaReservePolicy `json:"weekly_quota_reserve"`
+	Color              *string                   `json:"color"`
+	Annotation         json.RawMessage           `json:"annotation"`
 }
 
 func (p annotationPatch) accountKey() string {
@@ -1182,6 +1198,19 @@ func persistAnnotationState(store *PluginState, state AnnotationState) error {
 	disk.Accounts = state.Accounts
 	disk.Groups = state.Groups
 	return SaveUserData(semanticStatePaths(defaultStatePath()).UserData, disk)
+}
+
+func validateAnnotationState(state AnnotationState) error {
+	for key, annotation := range state.Accounts {
+		if err := validateAccountAnnotation(annotation); err != nil {
+			return fmt.Errorf("account annotation %q: %w", key, err)
+		}
+	}
+	return nil
+}
+
+func validateAccountAnnotation(annotation AccountAnnotation) error {
+	return validateWeeklyQuotaReservePolicy(annotation.WeeklyQuotaReserve)
 }
 
 func triggerRefreshSoon() {
@@ -1263,9 +1292,6 @@ var statusTemplateV2 = template.Must(template.New("status-v2").Funcs(template.Fu
 <label class="toggle"><span data-i18n="settings.usageFeedback">失败反馈标记额度耗尽</span><input id="usageFeedback" type="checkbox"></label>
 <div class="setting-with-help"><label class="toggle"><span data-i18n="settings.enableResetProbe">自动激活新的额度周期</span><input id="enableResetProbe" name="enable_reset_probe" type="checkbox"></label><p class="setting-help" data-i18n="settings.enableResetProbeHelp">当额度重置时间已经到达，但 OpenAI 尚未生成新的额度周期时，发送一次极小的 Codex 请求尝试激活新周期，然后重新读取额度确认结果。可能消耗少量额度。</p></div>
 <div class="setting-with-help"><label class="toggle"><span data-i18n="settings.provisionalProbe">账号列表未确认时仍允许额度探测（高风险）</span><input id="probeOnProvisionalRoster" name="probe_on_provisional_roster" type="checkbox"></label><p class="setting-help" data-i18n="settings.provisionalProbeHelp">CPA 暂时无法确认当前账号及优先级时，允许插件使用最近一次保存的账号列表执行额度重置探测。每次都会重新验证账号凭据，但仍无法保证账号未被删除或调整优先级。通常应保持关闭。</p></div>
-<div class="setting-with-help"><label class="toggle"><span data-i18n="settings.weeklyQuotaReserveEnabled">启用周额度储备</span><input id="weeklyQuotaReserveEnabled" name="enable_weekly_quota_reserve" type="checkbox"></label><p class="setting-help" data-i18n="settings.weeklyQuotaReserveEnabledHelp">开启后，周额度剩余低于保留比例且主动重置次数为 0 的账号会暂存，直到下次周额度重置前进入解封窗口。</p></div>
-<div class="setting-with-help"><label class="field"><span data-i18n="settings.weeklyQuotaReservePercent">周额度保留比例（%）</span><input id="weeklyQuotaReservePercent" type="number" min="0" max="100" step="0.1"></label><p class="setting-help" data-i18n="settings.weeklyQuotaReservePercentHelp">默认 20%。剩余额度严格低于该比例时才进入储备额度。</p></div>
-<div class="setting-with-help"><label class="field"><span data-i18n="settings.weeklyQuotaReserveUnlockWindow">储备额度解封窗口</span><input id="weeklyQuotaReserveUnlockWindow" spellcheck="false"></label><p class="setting-help" data-i18n="settings.weeklyQuotaReserveUnlockWindowHelp">默认 5h。距离下一次周额度重置少于该时间时，自动解封并重新参与调度。</p></div>
 <label class="field"><span data-i18n="settings.monthlyMode">月度账号使用方式</span><select id="monthlyMode"><option value="expiry_order" data-i18n="settings.expiryOrder">按到期时间排序</option><option value="priority" data-i18n="settings.monthlyPriority">优先使用月度账号</option></select></label>
 <label class="field"><span data-i18n="settings.refreshInterval">额度刷新间隔</span><input id="refreshInterval" spellcheck="false"></label>
 <label class="field"><span data-i18n="settings.staleAfter">缓存过期判定</span><input id="staleAfter" spellcheck="false"></label>
@@ -1288,7 +1314,7 @@ var statusTemplateV2 = template.Must(template.New("status-v2").Funcs(template.Fu
 <div class="toolbar"><div><h2 data-i18n="queue.title">账号队列</h2><p data-i18n="queue.description">账号卡片按当前调度优先级排序。第一个可用账号就是下一次 Codex 请求会优先选择的账号。</p></div><div class="metrics"><span class="metric"><span data-i18n="metrics.nextAccount">下一账号</span>：<code id="metricNextAuthID">{{if .NextAuthID}}{{.NextAuthID}}{{else}}暂无{{end}}</code></span><span class="metric">Monthly：<code id="metricMonthlyMode">{{if eq .MonthlyMode "priority"}}优先使用{{else}}按到期时间{{end}}</code></span><span class="metric"><span data-i18n="metrics.lastSelected">最近选择</span>：<code id="metricLastSelected">{{if .LastSelected}}{{.LastSelected}}{{else}}暂无{{end}}</code></span></div></div>
 <section class="queue" aria-label="账号卡片">{{range .Accounts}}<article class="card {{if and $.NextAuthID (eq $.NextAuthID .AuthID)}}next{{end}}" data-auth-id="{{.AuthID}}">
 <div class="cardTop"><div class="identity"><div class="titleLine"><span class="title">{{if .Alias}}{{.Alias}}{{else}}{{.AuthID}}{{end}}</span>{{if .Group}}<span class="groupPill">{{.Group}}</span>{{end}}</div><div class="sub"><code>{{.AuthID}}</code></div>{{if .Tags}}<div class="metaLine">{{range .Tags}}<span class="chip">{{.}}</span>{{end}}</div>{{end}}</div><span class="rank">#{{.Rank}}</span></div>
-<div class="badges">{{if and $.NextAuthID (eq $.NextAuthID .AuthID)}}<span class="badge next">下一优先</span>{{end}}{{if .Available}}<span class="badge ok">可用</span>{{else}}<span class="badge no">{{if eq .UnavailableReason "weekly_quota_reserve"}}周额度储备{{else}}{{.UnavailableReason}}{{end}}</span>{{end}}<span class="badge">{{if eq .Family "weekly"}}Weekly{{else if eq .Family "monthly"}}Monthly{{else}}未知类型{{end}}</span><span class="badge">CPA 优先级 {{.CPAPriority}}</span><span class="badge">插件优先级 {{.SchedulerPriority}}</span><span class="badge">熔断：{{.Circuit.Label}}</span></div>
+<div class="badges">{{if and $.NextAuthID (eq $.NextAuthID .AuthID)}}<span class="badge next">下一优先</span>{{end}}{{if .Available}}<span class="badge ok">可用</span>{{else}}<span class="badge no">{{if eq .UnavailableReason "weekly_quota_reserve"}}周额度储备{{else}}{{.UnavailableReason}}{{end}}</span>{{end}}<span class="badge">{{if eq .Family "weekly"}}Weekly{{else if eq .Family "monthly"}}Monthly{{else}}未知类型{{end}}</span><span class="badge">CPA 优先级 {{.CPAPriority}}</span><span class="badge">插件优先级 {{.SchedulerPriority}}</span>{{if and (eq .Family "weekly") .WeeklyQuotaReserve.Enabled}}<span class="badge">储备 {{printf "%.1f" .WeeklyQuotaReserve.Percent}}%</span>{{end}}<span class="badge">熔断：{{.Circuit.Label}}</span></div>
 <div class="quotaList">{{if not .FiveHour.Missing}}<div class="quota-row"><div class="quota-head"><span class="quota-title">{{.FiveHour.Label}}</span><span>{{.FiveHour.DisplayText}}</span><span class="quota-reset">5 小时重置：<span class="localTime" data-time="{{.FiveHour.ResetText}}">{{.FiveHour.ResetText}}</span></span></div><div class="quota-bar"><div class="quota-fill {{if .FiveHour.Exhausted}}danger{{else if le .FiveHour.RemainingPercent 20.0}}warn{{end}}" style="width:{{printf "%.0f" .FiveHour.RemainingPercent}}%"></div></div></div>{{end}}<div class="quota-row"><div class="quota-head"><span class="quota-title">{{.LongWindow.Label}}</span><span>{{.LongWindow.DisplayText}}</span>{{if not .LongWindow.Missing}}<span class="quota-reset">长额度重置：<span class="localTime" data-time="{{.LongWindow.ResetText}}">{{.LongWindow.ResetText}}</span></span>{{end}}</div><div class="quota-bar"><div class="quota-fill {{if .LongWindow.Exhausted}}danger{{else if le .LongWindow.RemainingPercent 20.0}}warn{{end}}" style="width:{{printf "%.0f" .LongWindow.RemainingPercent}}%"></div></div></div></div>
 <div class="kv"><span>缓存时间</span><span>{{if .CacheAge}}{{.CacheAge}}{{else}}暂无{{end}}</span><span>熔断计数</span><span>失败 {{.Circuit.FailureCount}} / 成功 {{.Circuit.SuccessCount}}{{if .Circuit.NextProbeText}}，半开 <span class="localTime" data-time="{{.Circuit.NextProbeText}}">{{.Circuit.NextProbeText}}</span>{{end}}</span><span>主动重置</span><span>{{if .ResetCreditsAvailableCount}}{{.ResetCreditsAvailableCount}} 次{{else}}暂无{{end}}{{if .ResetCreditsTotalEarnedCount}} / 累计 {{.ResetCreditsTotalEarnedCount}} 次{{end}}{{range .ResetCredits}}；{{if .Status}}{{.Status}} {{end}}有效期 <span class="localTime" data-time="{{.ExpiresAt}}">{{.ExpiresAt}}</span>{{end}}</span>{{if .StatusNote}}<span>调度状态</span><span>{{.StatusNote}}</span>{{end}}</div>
 {{if or .Notes .GroupNotes}}<div class="noteBlock">{{if .Notes}}<div>账号备注：{{.Notes}}</div>{{end}}{{if .GroupNotes}}<div>分组备注：{{.GroupNotes}}</div>{{end}}</div>{{end}}
@@ -1297,7 +1323,7 @@ var statusTemplateV2 = template.Must(template.New("status-v2").Funcs(template.Fu
 <section class="logs"><div class="logsHeader"><h2 data-i18n="logs.title">调度日志</h2><div class="actions"><button id="refreshLogs" type="button" class="ghost" data-i18n="actions.refreshLogs">刷新日志</button><button id="exportLogs" type="button" class="ghost" data-i18n="actions.exportLogs">导出日志</button></div></div><div id="logList" class="logList"></div></section>
 </main>
 </div>
-<dialog id="editDialog"><form method="dialog" class="dialogBody"><div class="dialogHead"><div><h2 data-i18n="edit.title">编辑账号</h2><p id="editAuthID"></p></div><button type="button" id="closeDialog" class="ghost" data-i18n="actions.close">关闭</button></div><div class="dialogGrid"><label class="field"><span data-i18n="edit.alias">别名</span><input id="editAlias"></label><label class="field"><span data-i18n="account.schedulerPriority">插件优先级</span><input id="editSchedulerPriority" type="number" step="1" value="0"></label><label class="field"><span data-i18n="edit.groupID">分组 ID</span><input id="editGroupID" placeholder="team-a"></label><label class="field"><span data-i18n="edit.groupName">分组名称</span><input id="editGroupName"></label><label class="field"><span data-i18n="edit.tags">标签</span><input id="editTags" placeholder="team, paid"></label><label class="field wide"><span data-i18n="edit.notes">账号备注</span><textarea id="editNotes"></textarea></label><label class="field wide"><span data-i18n="edit.groupNotes">分组备注</span><textarea id="editGroupNotes"></textarea></label></div><div class="dialogActions"><button type="button" id="saveAccount" class="secondary" data-i18n="actions.saveAccount">保存账号</button><button type="button" id="cancelEdit" class="ghost" data-i18n="actions.cancel">取消</button></div></form></dialog>
+<dialog id="editDialog"><form method="dialog" class="dialogBody"><div class="dialogHead"><div><h2 data-i18n="edit.title">编辑账号</h2><p id="editAuthID"></p></div><button type="button" id="closeDialog" class="ghost" data-i18n="actions.close">关闭</button></div><div class="dialogGrid"><label class="field"><span data-i18n="edit.alias">别名</span><input id="editAlias"></label><label class="field"><span data-i18n="account.schedulerPriority">插件优先级</span><input id="editSchedulerPriority" type="number" step="1" value="0"></label><div class="field wide" id="weeklyQuotaReserveEditor"><span data-i18n="edit.weeklyQuotaReserve">储备额度</span><label class="toggle"><span data-i18n="edit.weeklyQuotaReserveEnabled">启用储备额度</span><input id="editWeeklyQuotaReserveEnabled" type="checkbox"></label><div class="dialogGrid"><label class="field"><span data-i18n="edit.weeklyQuotaReservePercent">保留周额度（%）</span><input id="editWeeklyQuotaReservePercent" type="number" min="0.1" max="100" step="0.1" value="20"></label><label class="field"><span data-i18n="edit.weeklyQuotaReserveUnlockHours">重置前解封（小时）</span><input id="editWeeklyQuotaReserveUnlockHours" type="number" min="0.1" step="0.1" value="5"></label></div><p class="setting-help" id="weeklyQuotaReserveHelp" data-i18n="edit.weeklyQuotaReserveHelp">仅周额度账号生效；剩余额度低于保留比例且没有可用主动重置次数时，重置前进入解封窗口后自动恢复调度。</p></div><label class="field"><span data-i18n="edit.groupID">分组 ID</span><input id="editGroupID" placeholder="team-a"></label><label class="field"><span data-i18n="edit.groupName">分组名称</span><input id="editGroupName"></label><label class="field"><span data-i18n="edit.tags">标签</span><input id="editTags" placeholder="team, paid"></label><label class="field wide"><span data-i18n="edit.notes">账号备注</span><textarea id="editNotes"></textarea></label><label class="field wide"><span data-i18n="edit.groupNotes">分组备注</span><textarea id="editGroupNotes"></textarea></label></div><div class="dialogActions"><button type="button" id="saveAccount" class="secondary" data-i18n="actions.saveAccount">保存账号</button><button type="button" id="cancelEdit" class="ghost" data-i18n="actions.cancel">取消</button></div></form></dialog>
 <script>
 let STATUS={{json .}};
 const MANAGEMENT_BASE='/v0/management/plugins/codex-quota-scheduler';
@@ -1306,23 +1332,23 @@ const TRANSLATIONS={
   en:{
     'app.title':'Codex Quota Scheduler','app.subtitle':'Optimized Fill First scheduling. Configuration, aliases, groups, tags, and notes are saved in the plugin state file.','app.language':'Language','connection.managementKey':'CPA management key','connection.backgroundHint':'Once the scheduler is enabled, it runs in the background. This page does not need to stay open.',
     'resetProbe.warningTitle':'Automatic reset probe is off by default','resetProbe.warningBody':'Only after you check the box will the scheduler send one tiny Codex request when a reset looks lazy, nudging the next quota window to start.',
-    'settings.title':'Scheduler Settings','settings.summary':'Default configuration is ready; normally no manual changes are needed.','settings.handleEnabled':'Enable scheduler takeover','settings.usageFeedback':'Mark quota exhausted from failure feedback','settings.enableResetProbe':'Enable automatic reset probe','settings.enableResetProbeHelp':'When the quota reset time has arrived but OpenAI has not yet generated a new quota cycle, send one tiny Codex request to try to activate it, then read the quota again to confirm the result. This may consume a small amount of quota.','settings.provisionalProbe':'Allow quota probes when the account roster is unconfirmed (high risk)','settings.provisionalProbeHelp':'When CPA temporarily cannot confirm the current accounts and priorities, allow the plugin to use the most recently saved account roster for quota reset probes. Account credentials are revalidated every time, but the plugin still cannot guarantee that accounts have not been removed or reprioritized. This should normally remain off.','settings.weeklyQuotaReserveEnabled':'Enable weekly quota reserve','settings.weeklyQuotaReserveEnabledHelp':'When enabled, a weekly account below the reserve percentage with zero reset credits is held in reserve until it is less than one unlock window away from the next weekly reset.','settings.weeklyQuotaReservePercent':'Weekly quota reserve (%)','settings.weeklyQuotaReservePercentHelp':'Default 20%. An account enters reserve only when its remaining quota is strictly below this percentage.','settings.weeklyQuotaReserveUnlockWindow':'Reserve unlock window','settings.weeklyQuotaReserveUnlockWindowHelp':'Default 5h. When the next weekly reset is less than this window away, the account is released and can be scheduled again.','settings.monthlyMode':'Monthly mode','settings.expiryOrder':'Sort by expiry time','settings.monthlyPriority':'Prefer Monthly','settings.refreshInterval':'Quota refresh interval','settings.staleAfter':'Stale cache threshold','settings.refreshActiveWindow':'Refresh active window','settings.refreshAfterResetDelay':'Refresh after reset delay','settings.refreshRetryDelays':'Refresh retry delays','settings.refreshOnStartup':'Refresh on startup','settings.maxConcurrency':'Max refresh concurrency','settings.circuitFailureThreshold':'Circuit failure threshold','settings.circuitOpenDuration':'Circuit open duration','settings.circuitHalfOpenSuccessThreshold':'Half-open recovery successes','settings.maxLogEntries':'Max log entries','settings.logRetention':'Log retention',
+    'settings.title':'Scheduler Settings','settings.summary':'Default configuration is ready; normally no manual changes are needed.','settings.handleEnabled':'Enable scheduler takeover','settings.usageFeedback':'Mark quota exhausted from failure feedback','settings.enableResetProbe':'Enable automatic reset probe','settings.enableResetProbeHelp':'When the quota reset time has arrived but OpenAI has not yet generated a new quota cycle, send one tiny Codex request to try to activate it, then read the quota again to confirm the result. This may consume a small amount of quota.','settings.provisionalProbe':'Allow quota probes when the account roster is unconfirmed (high risk)','settings.provisionalProbeHelp':'When CPA temporarily cannot confirm the current accounts and priorities, allow the plugin to use the most recently saved account roster for quota reset probes. Account credentials are revalidated every time, but the plugin still cannot guarantee that accounts have not been removed or reprioritized. This should normally remain off.','settings.monthlyMode':'Monthly mode','settings.expiryOrder':'Sort by expiry time','settings.monthlyPriority':'Prefer Monthly','settings.refreshInterval':'Quota refresh interval','settings.staleAfter':'Stale cache threshold','settings.refreshActiveWindow':'Refresh active window','settings.refreshAfterResetDelay':'Refresh after reset delay','settings.refreshRetryDelays':'Refresh retry delays','settings.refreshOnStartup':'Refresh on startup','settings.maxConcurrency':'Max refresh concurrency','settings.circuitFailureThreshold':'Circuit failure threshold','settings.circuitOpenDuration':'Circuit open duration','settings.circuitHalfOpenSuccessThreshold':'Half-open recovery successes','settings.maxLogEntries':'Max log entries','settings.logRetention':'Log retention',
     'actions.loadData':'Load Data','actions.saveSettings':'Save Settings','actions.refreshQuota':'Refresh Quota','actions.exportConfig':'Export Config','actions.importConfig':'Import Config','actions.refreshLogs':'Refresh Logs','actions.exportLogs':'Export Logs','actions.close':'Close','actions.saveAccount':'Save Account','actions.cancel':'Cancel',
     'queue.title':'Account Queue','queue.description':'Account cards are sorted by the current scheduler priority. The first available account is preferred for the next Codex request.','metrics.nextAccount':'Next account','metrics.lastSelected':'Last selected',
     'logs.title':'Scheduler Logs','logs.empty':'No logs yet. Send a request or refresh quota manually to show records here.',
-    'edit.title':'Edit Account','edit.alias':'Alias','account.schedulerPriority':'Plugin priority','edit.groupID':'Group ID','edit.groupName':'Group name','edit.tags':'Tags','edit.notes':'Account notes','edit.groupNotes':'Group notes',
-    'notice.settingsSaved':'Settings saved.','notice.statusLoaded':'Current settings loaded. Review them, then save again.','notice.refreshRequested':'Background quota refresh requested.','notice.accountSaved':'Account card saved.','notice.refreshOneRequested':'Quota refresh requested for this account.','notice.configExported':'Configuration exported.','notice.logsExported':'Logs exported.','notice.configImported':'Configuration imported.','error.requestFailed':'Request failed: {status}','error.managementKeyRequired':'CPA management key is required','error.schedulerPriorityInteger':'Plugin priority must be a safe integer.',
+    'edit.title':'Edit Account','edit.alias':'Alias','account.schedulerPriority':'Plugin priority','edit.weeklyQuotaReserve':'Quota reserve','edit.weeklyQuotaReserveEnabled':'Enable quota reserve','edit.weeklyQuotaReservePercent':'Reserve weekly quota (%)','edit.weeklyQuotaReserveUnlockHours':'Unlock before reset (hours)','edit.weeklyQuotaReserveHelp':'Applies only to weekly accounts. With zero reset credits, quota below the reserve is held until the unlock window before the next reset.','edit.weeklyQuotaReserveMonthly':'Quota reserve applies only to weekly accounts.','edit.groupID':'Group ID','edit.groupName':'Group name','edit.tags':'Tags','edit.notes':'Account notes','edit.groupNotes':'Group notes',
+    'notice.settingsSaved':'Settings saved.','notice.statusLoaded':'Current settings loaded. Review them, then save again.','notice.refreshRequested':'Background quota refresh requested.','notice.accountSaved':'Account card saved.','notice.refreshOneRequested':'Quota refresh requested for this account.','notice.configExported':'Configuration exported.','notice.logsExported':'Logs exported.','notice.configImported':'Configuration imported.','error.requestFailed':'Request failed: {status}','error.managementKeyRequired':'CPA management key is required','error.schedulerPriorityInteger':'Plugin priority must be a safe integer.','error.weeklyQuotaReservePercent':'Reserve percentage must be greater than 0 and no greater than 100.','error.weeklyQuotaReserveUnlockHours':'Unlock time before reset must be greater than 0.',
     'log.ui.refresh_requested':'UI requested quota refresh','log.ui.settings_saved':'UI saved scheduler settings','log.ui.refresh_one_requested':'UI requested one account quota refresh','log.ui.config_exported':'UI exported plugin configuration','log.ui.config_imported':'UI imported plugin configuration','log.ui.account_saved':'UI saved account card','log.ui.group_saved':'UI saved account group','log.scheduler.selected':'Request handled by plugin'
   },
   'zh-CN':{
     'app.title':'Codex 额度调度器','app.subtitle':'优化版 Fill First。配置、别名、分组、标签和备注由插件内部状态文件保存。','app.language':'界面语言','connection.managementKey':'CPA 管理密钥','connection.backgroundHint':'只要调度器启动了，它就会在后台自动运行，无需保持页面开启。',
     'resetProbe.warningTitle':'自动激活新的额度周期默认关闭','resetProbe.warningBody':'开启后，调度器会在额度重置时间已到但新周期尚未生成时，发送一次极小的 Codex 请求尝试激活新周期。',
-    'settings.title':'调度设置','settings.summary':'默认配置已经都设置好了，正常情况下不需要手动设置。','settings.handleEnabled':'启用调度接管','settings.usageFeedback':'失败反馈标记额度耗尽','settings.enableResetProbe':'自动激活新的额度周期','settings.enableResetProbeHelp':'当额度重置时间已经到达，但 OpenAI 尚未生成新的额度周期时，发送一次极小的 Codex 请求尝试激活新周期，然后重新读取额度确认结果。可能消耗少量额度。','settings.provisionalProbe':'账号列表未确认时仍允许额度探测（高风险）','settings.provisionalProbeHelp':'CPA 暂时无法确认当前账号及优先级时，允许插件使用最近一次保存的账号列表执行额度重置探测。每次都会重新验证账号凭据，但仍无法保证账号未被删除或调整优先级。通常应保持关闭。','settings.weeklyQuotaReserveEnabled':'启用周额度储备','settings.weeklyQuotaReserveEnabledHelp':'开启后，周额度剩余低于保留比例且主动重置次数为 0 的账号会暂存，直到距离下次周额度重置少于解封窗口。','settings.weeklyQuotaReservePercent':'周额度保留比例（%）','settings.weeklyQuotaReservePercentHelp':'默认 20%。周额度剩余严格低于该比例时才进入储备额度。','settings.weeklyQuotaReserveUnlockWindow':'储备额度解封窗口','settings.weeklyQuotaReserveUnlockWindowHelp':'默认 5h。距离下一次周额度重置少于该时间时，自动解封并重新参与调度。','settings.monthlyMode':'月度账号使用方式','settings.expiryOrder':'按到期时间排序','settings.monthlyPriority':'优先使用月度账号','settings.refreshInterval':'额度刷新间隔','settings.staleAfter':'缓存过期判定','settings.refreshActiveWindow':'活跃刷新窗口','settings.refreshAfterResetDelay':'重置后刷新延迟','settings.refreshRetryDelays':'刷新失败重试间隔','settings.refreshOnStartup':'启动时刷新额度','settings.maxConcurrency':'最大并发刷新','settings.circuitFailureThreshold':'熔断失败阈值','settings.circuitOpenDuration':'熔断等待时间','settings.circuitHalfOpenSuccessThreshold':'半开恢复成功次数','settings.maxLogEntries':'最大日志条数','settings.logRetention':'日志保留时间',
+    'settings.title':'调度设置','settings.summary':'默认配置已经都设置好了，正常情况下不需要手动设置。','settings.handleEnabled':'启用调度接管','settings.usageFeedback':'失败反馈标记额度耗尽','settings.enableResetProbe':'自动激活新的额度周期','settings.enableResetProbeHelp':'当额度重置时间已经到达，但 OpenAI 尚未生成新的额度周期时，发送一次极小的 Codex 请求尝试激活新周期，然后重新读取额度确认结果。可能消耗少量额度。','settings.provisionalProbe':'账号列表未确认时仍允许额度探测（高风险）','settings.provisionalProbeHelp':'CPA 暂时无法确认当前账号及优先级时，允许插件使用最近一次保存的账号列表执行额度重置探测。每次都会重新验证账号凭据，但仍无法保证账号未被删除或调整优先级。通常应保持关闭。','settings.monthlyMode':'月度账号使用方式','settings.expiryOrder':'按到期时间排序','settings.monthlyPriority':'优先使用月度账号','settings.refreshInterval':'额度刷新间隔','settings.staleAfter':'缓存过期判定','settings.refreshActiveWindow':'活跃刷新窗口','settings.refreshAfterResetDelay':'重置后刷新延迟','settings.refreshRetryDelays':'刷新失败重试间隔','settings.refreshOnStartup':'启动时刷新额度','settings.maxConcurrency':'最大并发刷新','settings.circuitFailureThreshold':'熔断失败阈值','settings.circuitOpenDuration':'熔断等待时间','settings.circuitHalfOpenSuccessThreshold':'半开恢复成功次数','settings.maxLogEntries':'最大日志条数','settings.logRetention':'日志保留时间',
     'actions.loadData':'加载数据','actions.saveSettings':'保存设置','actions.refreshQuota':'刷新额度','actions.exportConfig':'导出配置','actions.importConfig':'导入配置','actions.refreshLogs':'刷新日志','actions.exportLogs':'导出日志','actions.close':'关闭','actions.saveAccount':'保存账号','actions.cancel':'取消',
     'queue.title':'账号队列','queue.description':'账号卡片按当前调度优先级排序。第一个可用账号就是下一次 Codex 请求会优先选择的账号。','metrics.nextAccount':'下一账号','metrics.lastSelected':'最近选择',
     'logs.title':'调度日志','logs.empty':'暂无日志。发起请求或手动刷新额度后，这里会显示记录。',
-    'edit.title':'编辑账号','edit.alias':'别名','account.schedulerPriority':'插件优先级','edit.groupID':'分组 ID','edit.groupName':'分组名称','edit.tags':'标签','edit.notes':'账号备注','edit.groupNotes':'分组备注',
-    'notice.settingsSaved':'设置已保存，页面内容会自动更新。','notice.statusLoaded':'已加载当前设置。请确认后再次保存。','notice.refreshRequested':'已请求后台刷新额度，页面内容会自动更新。','notice.accountSaved':'账号卡片已保存，页面内容会自动更新。','notice.refreshOneRequested':'已请求刷新该账号额度，页面内容会自动更新。','notice.configExported':'配置已导出。','notice.logsExported':'日志已导出。','notice.configImported':'配置已导入，页面内容会自动更新。','error.requestFailed':'请求失败：{status}','error.managementKeyRequired':'需要填写 CPA 管理密钥','error.schedulerPriorityInteger':'插件优先级必须是安全整数。'
+    'edit.title':'编辑账号','edit.alias':'别名','account.schedulerPriority':'插件优先级','edit.weeklyQuotaReserve':'储备额度','edit.weeklyQuotaReserveEnabled':'启用储备额度','edit.weeklyQuotaReservePercent':'保留周额度（%）','edit.weeklyQuotaReserveUnlockHours':'重置前解封（小时）','edit.weeklyQuotaReserveHelp':'仅周额度账号生效；剩余额度低于保留比例且没有可用主动重置次数时，重置前进入解封窗口后自动恢复调度。','edit.weeklyQuotaReserveMonthly':'储备额度仅适用于周额度账号。','edit.groupID':'分组 ID','edit.groupName':'分组名称','edit.tags':'标签','edit.notes':'账号备注','edit.groupNotes':'分组备注',
+    'notice.settingsSaved':'设置已保存，页面内容会自动更新。','notice.statusLoaded':'已加载当前设置。请确认后再次保存。','notice.refreshRequested':'已请求后台刷新额度，页面内容会自动更新。','notice.accountSaved':'账号卡片已保存，页面内容会自动更新。','notice.refreshOneRequested':'已请求刷新该账号额度，页面内容会自动更新。','notice.configExported':'配置已导出。','notice.logsExported':'日志已导出。','notice.configImported':'配置已导入，页面内容会自动更新。','error.requestFailed':'请求失败：{status}','error.managementKeyRequired':'需要填写 CPA 管理密钥','error.schedulerPriorityInteger':'插件优先级必须是安全整数。','error.weeklyQuotaReservePercent':'保留周额度必须大于 0 且不超过 100。','error.weeklyQuotaReserveUnlockHours':'重置前解封时间必须大于 0。'
   }
 };
 const notice=document.getElementById('notice');
@@ -1332,6 +1358,7 @@ const settingsPanel=document.getElementById('settingsPanel');
 const accountsByID=new Map();
 const groupsByID=new Map();
 let editingAuthID='';
+let editingAccountFamily='';
 let currentLocale=detectLocale();
 let statusLoaded=!STATUS.shell;
 let settingsDirty=false;
@@ -1352,7 +1379,7 @@ const INLINE_TRANSLATIONS=[
   ['调度器处于休眠状态','The scheduler is sleeping'],['最近 ','No Codex requests were observed in the last '],[' 内没有观察到 Codex 请求',''],['系统暂不主动扫描账号','the system will not actively scan accounts'],['发送第一次 Codex 请求后将自动获取账号额度信息','Send the first Codex request to fetch account quota automatically'],
   ['内没有 Codex 请求，调度器已暂停后台刷新',' without a Codex request, so background refresh is paused'],['发送一次 Codex 请求后会重新进入活跃窗口并获取账号额度信息','Send one Codex request to re-enter the active window and fetch account quota'],
   ['等待账号额度数据','Waiting for account quota data'],['已观察到 Codex 请求，调度器处于活跃窗口','A Codex request was observed and the scheduler is in its active window'],['账号额度刷新完成后，这里会显示账号卡片','Account cards will appear here after quota refresh finishes'],['等待额度刷新后，这里会显示账号卡片','Account cards will appear here after quota refresh'],
-  ['认证信息异常，请重新登录。','Authentication looks invalid. Please re-login.'],['周额度储备，预计 ','Weekly quota reserve; unlock at '],['周额度储备已解封，预计 ','Weekly quota reserve released; reset at '],['上次额度刷新失败，调度器正在等待下次自动重试。','The last quota refresh failed. The scheduler is waiting for the next automatic retry.'],
+  ['认证信息异常，请重新登录。','Authentication looks invalid. Please re-login.'],['周额度储备，当前剩余 ','Weekly quota reserve; remaining '],['，低于保留额度 ','; below reserve '],['，预计 ','; unlock at '],[' 解封。',' unlock.'],['周额度储备已解封，预计 ','Weekly quota reserve released; reset at '],['上次额度刷新失败，调度器正在等待下次自动重试。','The last quota refresh failed. The scheduler is waiting for the next automatic retry.'],
   ['账号额度已过期，调度器处于活跃窗口，将按刷新队列更新。','Quota data is stale. The scheduler is active and will update it through the refresh queue.'],['账号尚未获取额度信息，调度器处于活跃窗口，将按刷新队列更新。','Quota has not been fetched yet. The scheduler is active and will update it through the refresh queue.'],
   ['上次额度刷新失败，当前已到重试时间。','The last quota refresh failed, and retry is due now.'],['额度重置时间已到，调度器将按刷新队列更新。','Quota reset time has arrived; the scheduler will update it through the refresh queue.'],
   ['账号处于熔断等待中，半开探测时间到达后会重试。','The account is in circuit wait and will retry after the half-open probe time.'],['本地认证信息缺失或格式异常，请检查登录状态。','Local auth data is missing or malformed. Please check sign-in state.'],
@@ -1389,7 +1416,7 @@ async function refreshStatus(options){const opts=options||{};const data=await re
 function startStatusPolling(){if(statusPollID)return;statusPollID=window.setInterval(()=>refreshStatus({management:true}).catch(()=>{}),15000)}
 async function loadStatus(){try{await refreshStatus({management:true,fillSettings:true});showNotice(t('notice.statusLoaded'),false);startStatusPolling()}catch(error){showNotice(error.message||String(error),true)}}
 async function pollStatus(times,delayMs){for(let i=0;i<times;i++){await new Promise((resolve)=>window.setTimeout(resolve,delayMs));await refreshStatus()}}
-function collectSettingsPayload(){return{handle_enabled:document.getElementById('handleEnabled').checked,enable_usage_feedback:document.getElementById('usageFeedback').checked,enable_reset_probe:document.getElementById('enableResetProbe').checked,probe_on_provisional_roster:document.getElementById('probeOnProvisionalRoster').checked,enable_weekly_quota_reserve:document.getElementById('weeklyQuotaReserveEnabled').checked,weekly_quota_reserve_percent:Number.parseFloat(document.getElementById('weeklyQuotaReservePercent').value)||0,weekly_quota_reserve_unlock_window:document.getElementById('weeklyQuotaReserveUnlockWindow').value.trim(),monthly_mode:document.getElementById('monthlyMode').value,quota_refresh_interval:document.getElementById('refreshInterval').value.trim(),stale_after:document.getElementById('staleAfter').value.trim(),refresh_active_window:document.getElementById('refreshActiveWindow').value.trim(),refresh_after_reset_delay:document.getElementById('refreshAfterResetDelay').value.trim(),refresh_retry_delays:document.getElementById('refreshRetryDelays').value.trim(),refresh_on_startup:document.getElementById('refreshOnStartup').checked,max_refresh_concurrency:Number.parseInt(document.getElementById('maxConcurrency').value,10)||1,circuit_failure_threshold:Number.parseInt(document.getElementById('circuitFailureThreshold').value,10)||5,circuit_open_duration:document.getElementById('circuitOpenDuration').value.trim(),circuit_half_open_success_threshold:Number.parseInt(document.getElementById('circuitHalfOpenSuccessThreshold').value,10)||2,max_log_entries:Number.parseInt(document.getElementById('maxLogEntries').value,10)||200,log_retention:document.getElementById('logRetention').value.trim()}}
+function collectSettingsPayload(){return{handle_enabled:document.getElementById('handleEnabled').checked,enable_usage_feedback:document.getElementById('usageFeedback').checked,enable_reset_probe:document.getElementById('enableResetProbe').checked,probe_on_provisional_roster:document.getElementById('probeOnProvisionalRoster').checked,monthly_mode:document.getElementById('monthlyMode').value,quota_refresh_interval:document.getElementById('refreshInterval').value.trim(),stale_after:document.getElementById('staleAfter').value.trim(),refresh_active_window:document.getElementById('refreshActiveWindow').value.trim(),refresh_after_reset_delay:document.getElementById('refreshAfterResetDelay').value.trim(),refresh_retry_delays:document.getElementById('refreshRetryDelays').value.trim(),refresh_on_startup:document.getElementById('refreshOnStartup').checked,max_refresh_concurrency:Number.parseInt(document.getElementById('maxConcurrency').value,10)||1,circuit_failure_threshold:Number.parseInt(document.getElementById('circuitFailureThreshold').value,10)||5,circuit_open_duration:document.getElementById('circuitOpenDuration').value.trim(),circuit_half_open_success_threshold:Number.parseInt(document.getElementById('circuitHalfOpenSuccessThreshold').value,10)||2,max_log_entries:Number.parseInt(document.getElementById('maxLogEntries').value,10)||200,log_retention:document.getElementById('logRetention').value.trim()}}
 function node(tag,className,text){const item=document.createElement(tag);if(className)item.className=className;if(text!==undefined)item.textContent=text;return item}
 function addKV(parent,key,value){parent.append(node('span','',key),node('span','',value||'暂无'))}
 function addBadge(text,className){return node('span','badge '+(className||''),text)}
@@ -1397,18 +1424,19 @@ function addQuota(windowData,label){const row=node('div','quota-row');const head
 function dateLocale(){return currentLocale==='en'?'en-US':'zh-CN'}
 function resetCreditSummary(account){const parts=[];if(account.reset_credits_available_count==null){parts.push('暂无')}else{parts.push(String(account.reset_credits_available_count)+' 次')}if(account.reset_credits_total_earned_count!=null)parts.push('/ 累计 '+account.reset_credits_total_earned_count+' 次');for(const credit of account.reset_credits||[]){const raw=credit.expires_at||'';if(!raw)continue;const date=new Date(raw);const expiry=Number.isNaN(date.getTime())?raw:date.toLocaleString(dateLocale(),{hour12:false});parts.push('；'+(credit.status?credit.status+' ':'')+'有效期 '+expiry)}return parts.join(' ')}
 function renderEmptyState(){const empty=STATUS.empty_state||{};const title=empty.title||'暂无账号数据';const message=empty.message||'等待额度刷新后，这里会显示账号卡片。';const box=node('div','empty','');box.append(node('strong','',title),node('div','',message));return box}
-function renderAccounts(accounts){const queue=document.querySelector('section.queue');if(!queue)return;queue.replaceChildren();const items=Array.isArray(accounts)?accounts:[];if(items.length===0){queue.append(renderEmptyState());return}for(const account of items){const card=node('article','card '+(STATUS.next_auth_id&&STATUS.next_auth_id===account.auth_id?'next':''));card.dataset.authId=account.auth_id||'';const top=node('div','cardTop');const identity=node('div','identity');const titleLine=node('div','titleLine');titleLine.append(node('span','title',account.alias||account.auth_id||''));if(account.group)titleLine.append(node('span','groupPill',account.group));identity.append(titleLine);const sub=node('div','sub');const code=document.createElement('code');code.textContent=account.auth_id||'';sub.append(code);identity.append(sub);if(account.tags&&account.tags.length){const tags=node('div','metaLine');for(const tag of account.tags)tags.append(node('span','chip',tag));identity.append(tags)}top.append(identity,node('span','rank','#'+(account.rank||'')));card.append(top);const badges=node('div','badges');if(STATUS.next_auth_id&&STATUS.next_auth_id===account.auth_id)badges.append(addBadge('下一优先','next'));badges.append(account.available?addBadge('可用','ok'):addBadge(labelUnavailableReason(account.unavailable_reason),'no'));badges.append(addBadge(account.family||'未知类型'),addBadge('CPA 优先级 '+(account.cpa_priority||0)),addBadge('插件优先级 '+(account.scheduler_priority||0)),addBadge('熔断：'+((account.circuit&&account.circuit.label)||'')));if(account.auth_failure)badges.append(addBadge('请重新登录','no'));if(account.refresh_due_reason)badges.append(addBadge(labelDueReason(account.refresh_due_reason)));card.append(badges);const quotaList=node('div','quotaList');if(account.five_hour&&!account.five_hour.missing)quotaList.append(addQuota(account.five_hour,'5 小时额度'));if(account.long_window)quotaList.append(addQuota(account.long_window,account.long_window.label||'长额度'));card.append(quotaList);const kv=node('div','kv');addKV(kv,'缓存时间',account.cache_age||'暂无');addKV(kv,'熔断计数','失败 '+((account.circuit&&account.circuit.failure_count)||0)+' / 成功 '+((account.circuit&&account.circuit.success_count)||0));addKV(kv,'主动重置',resetCreditSummary(account));if(account.status_note)addKV(kv,'调度状态',account.status_note);if(account.last_error)addKV(kv,'最后错误',account.last_error);if(account.next_retry_text)addKV(kv,'下次重试',account.next_retry_text);card.append(kv);if(account.notes||account.group_notes){const notes=node('div','noteBlock');if(account.notes)notes.append(node('div','',account.notes));if(account.group_notes)notes.append(node('div','',account.group_notes));card.append(notes)}const actions=node('div','cardActions');const refresh=node('button','ghost refreshOne','刷新额度');refresh.type='button';refresh.addEventListener('click',()=>refreshOneQuota(account.auth_id||''));const edit=node('button','secondary openEdit','编辑');edit.type='button';edit.addEventListener('click',()=>openEdit(account.auth_id||''));actions.append(refresh,edit);card.append(actions);queue.append(card)}formatLocalTimes()}
+function renderAccounts(accounts){const queue=document.querySelector('section.queue');if(!queue)return;queue.replaceChildren();const items=Array.isArray(accounts)?accounts:[];if(items.length===0){queue.append(renderEmptyState());return}for(const account of items){const card=node('article','card '+(STATUS.next_auth_id&&STATUS.next_auth_id===account.auth_id?'next':''));card.dataset.authId=account.auth_id||'';const top=node('div','cardTop');const identity=node('div','identity');const titleLine=node('div','titleLine');titleLine.append(node('span','title',account.alias||account.auth_id||''));if(account.group)titleLine.append(node('span','groupPill',account.group));identity.append(titleLine);const sub=node('div','sub');const code=document.createElement('code');code.textContent=account.auth_id||'';sub.append(code);identity.append(sub);if(account.tags&&account.tags.length){const tags=node('div','metaLine');for(const tag of account.tags)tags.append(node('span','chip',tag));identity.append(tags)}top.append(identity,node('span','rank','#'+(account.rank||'')));card.append(top);const badges=node('div','badges');if(STATUS.next_auth_id&&STATUS.next_auth_id===account.auth_id)badges.append(addBadge('下一优先','next'));badges.append(account.available?addBadge('可用','ok'):addBadge(labelUnavailableReason(account.unavailable_reason),'no'));badges.append(addBadge(account.family||'未知类型'),addBadge('CPA 优先级 '+(account.cpa_priority||0)),addBadge('插件优先级 '+(account.scheduler_priority||0)),addBadge('熔断：'+((account.circuit&&account.circuit.label)||'')));if(account.family==='weekly'&&account.weekly_quota_reserve&&account.weekly_quota_reserve.enabled)badges.append(addBadge('储备 '+(account.weekly_quota_reserve.percent||20)+'%'));if(account.auth_failure)badges.append(addBadge('请重新登录','no'));if(account.refresh_due_reason)badges.append(addBadge(labelDueReason(account.refresh_due_reason)));card.append(badges);const quotaList=node('div','quotaList');if(account.five_hour&&!account.five_hour.missing)quotaList.append(addQuota(account.five_hour,'5 小时额度'));if(account.long_window)quotaList.append(addQuota(account.long_window,account.long_window.label||'长额度'));card.append(quotaList);const kv=node('div','kv');addKV(kv,'缓存时间',account.cache_age||'暂无');addKV(kv,'熔断计数','失败 '+((account.circuit&&account.circuit.failure_count)||0)+' / 成功 '+((account.circuit&&account.circuit.success_count)||0));addKV(kv,'主动重置',resetCreditSummary(account));if(account.status_note)addKV(kv,'调度状态',account.status_note);if(account.last_error)addKV(kv,'最后错误',account.last_error);if(account.next_retry_text)addKV(kv,'下次重试',account.next_retry_text);card.append(kv);if(account.notes||account.group_notes){const notes=node('div','noteBlock');if(account.notes)notes.append(node('div','',account.notes));if(account.group_notes)notes.append(node('div','',account.group_notes));card.append(notes)}const actions=node('div','cardActions');const refresh=node('button','ghost refreshOne','刷新额度');refresh.type='button';refresh.addEventListener('click',()=>refreshOneQuota(account.auth_id||''));const edit=node('button','secondary openEdit','编辑');edit.type='button';edit.addEventListener('click',()=>openEdit(account.auth_id||''));actions.append(refresh,edit);card.append(actions);queue.append(card)}formatLocalTimes()}
 
 async function readJSON(resp){const text=await resp.text();if(!text)return{};try{return JSON.parse(text)}catch{return{error:text}}}
 function authHeaders(){const input=document.getElementById('managementKey');const key=(input&&input.value||'').trim();if(!key)throw new Error(t('error.managementKeyRequired'));const name='Author'+'ization';const scheme='Bea'+'rer ';const headers={};headers[name]=key.toLowerCase().startsWith(scheme.toLowerCase())?key:scheme+key;return headers}
 async function requestManagement(path,options){const opts=options||{};const headers=authHeaders();let url=MANAGEMENT_BASE+path;if(opts.query){const params=new URLSearchParams(opts.query);url+='?'+params.toString()}const init={method:opts.method||'GET',headers};if(Object.prototype.hasOwnProperty.call(opts,'body')){headers['Content-Type']=opts.contentType||'application/json';init.body=typeof opts.body==='string'?opts.body:JSON.stringify(opts.body)}const resp=await fetch(url,init);const data=await readJSON(resp);if(!resp.ok)throw new Error(data.error||data.message||t('error.requestFailed',{status:resp.status}));return data}
-function fillSettings(){const s=STATUS.settings||{};document.getElementById('handleEnabled').checked=s.handle_enabled!==false;document.getElementById('usageFeedback').checked=s.enable_usage_feedback!==false;document.getElementById('enableResetProbe').checked=s.enable_reset_probe===true;document.getElementById('probeOnProvisionalRoster').checked=s.probe_on_provisional_roster===true;document.getElementById('weeklyQuotaReserveEnabled').checked=s.enable_weekly_quota_reserve!==false;document.getElementById('weeklyQuotaReservePercent').value=s.weekly_quota_reserve_percent??20;document.getElementById('weeklyQuotaReserveUnlockWindow').value=s.weekly_quota_reserve_unlock_window||'5h0m0s';document.getElementById('monthlyMode').value=s.monthly_mode||'expiry_order';document.getElementById('refreshInterval').value=s.quota_refresh_interval||'30m0s';document.getElementById('staleAfter').value=s.stale_after||'5h0m0s';document.getElementById('refreshActiveWindow').value=s.refresh_active_window||'1h0m0s';document.getElementById('refreshAfterResetDelay').value=s.refresh_after_reset_delay||'1m0s';document.getElementById('refreshRetryDelays').value=s.refresh_retry_delays||'1m0s,5m0s,15m0s';document.getElementById('refreshOnStartup').checked=s.refresh_on_startup===true;document.getElementById('maxConcurrency').value=s.max_refresh_concurrency||1;document.getElementById('circuitFailureThreshold').value=s.circuit_failure_threshold||5;document.getElementById('circuitOpenDuration').value=s.circuit_open_duration||'30m0s';document.getElementById('circuitHalfOpenSuccessThreshold').value=s.circuit_half_open_success_threshold||2;document.getElementById('maxLogEntries').value=s.max_log_entries||200;document.getElementById('logRetention').value=s.log_retention||'24h0m0s'}
+function fillSettings(){const s=STATUS.settings||{};document.getElementById('handleEnabled').checked=s.handle_enabled!==false;document.getElementById('usageFeedback').checked=s.enable_usage_feedback!==false;document.getElementById('enableResetProbe').checked=s.enable_reset_probe===true;document.getElementById('probeOnProvisionalRoster').checked=s.probe_on_provisional_roster===true;document.getElementById('monthlyMode').value=s.monthly_mode||'expiry_order';document.getElementById('refreshInterval').value=s.quota_refresh_interval||'30m0s';document.getElementById('staleAfter').value=s.stale_after||'5h0m0s';document.getElementById('refreshActiveWindow').value=s.refresh_active_window||'1h0m0s';document.getElementById('refreshAfterResetDelay').value=s.refresh_after_reset_delay||'1m0s';document.getElementById('refreshRetryDelays').value=s.refresh_retry_delays||'1m0s,5m0s,15m0s';document.getElementById('refreshOnStartup').checked=s.refresh_on_startup===true;document.getElementById('maxConcurrency').value=s.max_refresh_concurrency||1;document.getElementById('circuitFailureThreshold').value=s.circuit_failure_threshold||5;document.getElementById('circuitOpenDuration').value=s.circuit_open_duration||'30m0s';document.getElementById('circuitHalfOpenSuccessThreshold').value=s.circuit_half_open_success_threshold||2;document.getElementById('maxLogEntries').value=s.max_log_entries||200;document.getElementById('logRetention').value=s.log_retention||'24h0m0s'}
 async function saveSettings(){try{if(!statusLoaded){await loadStatus();return}await requestManagement('/settings',{method:'PUT',body:collectSettingsPayload()});settingsDirty=false;showNotice(t('notice.settingsSaved'),false);await refreshStatus({management:true,fillSettings:true})}catch(error){showNotice(error.message||String(error),true)}}
 async function refreshQuota(){try{await requestManagement('/refresh',{method:'POST'});showNotice(t('notice.refreshRequested'),false);await refreshStatus({management:true});pollStatus(3,1200)}catch(error){showNotice(error.message||String(error),true)}}
 function splitTags(text){return text.split(',').map((item)=>item.trim()).filter(Boolean)}
-function openEdit(authID){if(!hasManagementKey()){showNotice(t('error.managementKeyRequired'),true);return}const account=accountsByID.get(authID)||{};editingAuthID=authID;document.getElementById('editAuthID').textContent=authID;document.getElementById('editAlias').value=account.alias||'';document.getElementById('editSchedulerPriority').value=account.scheduler_priority||0;document.getElementById('editNotes').value=account.notes||'';document.getElementById('editGroupID').value=account.group_id||'';document.getElementById('editGroupName').value=account.group||'';document.getElementById('editGroupNotes').value=account.group_notes||'';document.getElementById('editTags').value=(account.tags||[]).join(', ');editDialog.showModal()}
+function syncWeeklyQuotaReserveEditor(){const weekly=editingAccountFamily==='weekly'||!editingAccountFamily||editingAccountFamily==='unknown';const enabled=document.getElementById('editWeeklyQuotaReserveEnabled');const percent=document.getElementById('editWeeklyQuotaReservePercent');const hours=document.getElementById('editWeeklyQuotaReserveUnlockHours');const help=document.getElementById('weeklyQuotaReserveHelp');enabled.disabled=!weekly;percent.disabled=!weekly||!enabled.checked;hours.disabled=!weekly||!enabled.checked;help.textContent=weekly?t('edit.weeklyQuotaReserveHelp'):t('edit.weeklyQuotaReserveMonthly')}
+function openEdit(authID){if(!hasManagementKey()){showNotice(t('error.managementKeyRequired'),true);return}const account=accountsByID.get(authID)||{};const reserve=account.weekly_quota_reserve||{};editingAuthID=authID;editingAccountFamily=account.family||'';document.getElementById('editAuthID').textContent=authID;document.getElementById('editAlias').value=account.alias||'';document.getElementById('editSchedulerPriority').value=account.scheduler_priority||0;document.getElementById('editWeeklyQuotaReserveEnabled').checked=reserve.enabled===true;document.getElementById('editWeeklyQuotaReservePercent').value=reserve.percent??20;document.getElementById('editWeeklyQuotaReserveUnlockHours').value=reserve.unlock_hours??5;document.getElementById('editNotes').value=account.notes||'';document.getElementById('editGroupID').value=account.group_id||'';document.getElementById('editGroupName').value=account.group||'';document.getElementById('editGroupNotes').value=account.group_notes||'';document.getElementById('editTags').value=(account.tags||[]).join(', ');syncWeeklyQuotaReserveEditor();editDialog.showModal()}
 function fillGroupFromID(){const groupID=document.getElementById('editGroupID').value.trim();const group=groupsByID.get(groupID);if(!group)return;if(!document.getElementById('editGroupName').value.trim())document.getElementById('editGroupName').value=group.name||'';if(!document.getElementById('editGroupNotes').value.trim())document.getElementById('editGroupNotes').value=group.notes||''}
-async function saveAccountModal(){if(!editingAuthID)return;const groupID=document.getElementById('editGroupID').value.trim();const groupName=document.getElementById('editGroupName').value.trim();const groupNotes=document.getElementById('editGroupNotes').value.trim();const schedulerPriority=document.getElementById('editSchedulerPriority').valueAsNumber;if(!Number.isSafeInteger(schedulerPriority)){showNotice(t('error.schedulerPriorityInteger'),true);return}try{await requestManagement('/annotations/account',{method:'PATCH',body:{auth_id:editingAuthID,alias:document.getElementById('editAlias').value,notes:document.getElementById('editNotes').value,tags:splitTags(document.getElementById('editTags').value),group_id:groupID,scheduler_priority:schedulerPriority}});const existingGroup=groupsByID.get(groupID)||{name:'',notes:''};if(groupID&&(groupName!==existingGroup.name||groupNotes!==existingGroup.notes)){await requestManagement('/annotations/group',{method:'PATCH',body:{id:groupID,name:groupName,notes:groupNotes}});groupsByID.set(groupID,{name:groupName,notes:groupNotes})}showNotice(t('notice.accountSaved'),false);editDialog.close();await refreshStatus()}catch(error){showNotice(error.message||String(error),true)}}
+async function saveAccountModal(){if(!editingAuthID)return;const groupID=document.getElementById('editGroupID').value.trim();const groupName=document.getElementById('editGroupName').value.trim();const groupNotes=document.getElementById('editGroupNotes').value.trim();const schedulerPriority=document.getElementById('editSchedulerPriority').valueAsNumber;const reserveEnabled=document.getElementById('editWeeklyQuotaReserveEnabled').checked;const reservePercent=document.getElementById('editWeeklyQuotaReservePercent').valueAsNumber;const reserveUnlockHours=document.getElementById('editWeeklyQuotaReserveUnlockHours').valueAsNumber;if(!Number.isSafeInteger(schedulerPriority)){showNotice(t('error.schedulerPriorityInteger'),true);return}if(reserveEnabled&&(!Number.isFinite(reservePercent)||reservePercent<=0||reservePercent>100)){showNotice(t('error.weeklyQuotaReservePercent'),true);return}if(reserveEnabled&&(!Number.isFinite(reserveUnlockHours)||reserveUnlockHours<=0)){showNotice(t('error.weeklyQuotaReserveUnlockHours'),true);return}try{await requestManagement('/annotations/account',{method:'PATCH',body:{auth_id:editingAuthID,alias:document.getElementById('editAlias').value,notes:document.getElementById('editNotes').value,tags:splitTags(document.getElementById('editTags').value),group_id:groupID,scheduler_priority:schedulerPriority,weekly_quota_reserve:{enabled:reserveEnabled,percent:Number.isFinite(reservePercent)&&reservePercent>0?reservePercent:20,unlock_hours:Number.isFinite(reserveUnlockHours)&&reserveUnlockHours>0?reserveUnlockHours:5}}});const existingGroup=groupsByID.get(groupID)||{name:'',notes:''};if(groupID&&(groupName!==existingGroup.name||groupNotes!==existingGroup.notes)){await requestManagement('/annotations/group',{method:'PATCH',body:{id:groupID,name:groupName,notes:groupNotes}});groupsByID.set(groupID,{name:groupName,notes:groupNotes})}showNotice(t('notice.accountSaved'),false);editDialog.close();await refreshStatus()}catch(error){showNotice(error.message||String(error),true)}}
 async function refreshOneQuota(authID){if(!authID)return;try{await requestManagement('/refresh/account',{method:'POST',body:{auth_id:authID}});showNotice(t('notice.refreshOneRequested'),false);await refreshStatus();pollStatus(3,1200)}catch(error){showNotice(error.message||String(error),true)}}
 async function exportConfig(){try{const data=await requestManagement('/export');const blob=new Blob([JSON.stringify(data,null,2)+'\n'],{type:'application/json'});const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='codex-quota-scheduler-config.json';link.click();URL.revokeObjectURL(link.href);showNotice(t('notice.configExported'),false);await refreshLogs()}catch(error){showNotice(error.message||String(error),true)}}
 async function exportLogs(){try{await refreshStatus({management:true});const payload={plugin_id:STATUS.plugin_id||'codex-quota-scheduler',exported_at:new Date().toISOString(),logs:STATUS.logs||[]};const blob=new Blob([JSON.stringify(payload,null,2)+'\n'],{type:'application/json'});const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='codex-quota-scheduler-logs.json';link.click();URL.revokeObjectURL(link.href);showNotice(t('notice.logsExported'),false)}catch(error){showNotice(error.message||String(error),true)}}
@@ -1433,6 +1461,7 @@ settingsPanel.addEventListener('input',()=>{settingsDirty=true});
 settingsPanel.addEventListener('change',()=>{settingsDirty=true});
 document.getElementById('editGroupID').addEventListener('input',fillGroupFromID);
 document.getElementById('editGroupID').addEventListener('blur',fillGroupFromID);
+document.getElementById('editWeeklyQuotaReserveEnabled').addEventListener('change',syncWeeklyQuotaReserveEditor);
 document.getElementById('closeDialog').addEventListener('click',()=>editDialog.close());
 document.getElementById('cancelEdit').addEventListener('click',()=>editDialog.close());
 for(const button of document.querySelectorAll('.openEdit')){button.addEventListener('click',()=>openEdit(button.dataset.authId||''))}

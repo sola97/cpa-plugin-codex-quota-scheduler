@@ -709,7 +709,7 @@ func TestStatusHTMLUsesManagementAPIActionsModalProgressAndLogs(t *testing.T) {
 	}
 	html := string(resp.Body)
 	lower := strings.ToLower(html)
-	for _, want := range []string{"quota-bar", "editDialog", "logList", "openEdit", "exportLogs", "codex-quota-scheduler-logs.json", "maxLogEntries", "logRetention", "refreshOneQuota", "refreshStatus", "renderAccounts", "renderMetrics", "metricNextAuthID", "metricMonthlyMode", "metricLastSelected", "managementKey", "loadStatus", "MANAGEMENT_BASE", "/v0/management/plugins/codex-quota-scheduler", "authHeaders()", "localeSelect", "TRANSLATIONS", "codex-quota-scheduler-locale-v1", "Scheduler Settings", "Account Queue", "INLINE_TRANSLATIONS", "Reset credits", "Refresh Quota", `id="editSchedulerPriority"`, "account.schedulerPriority", "scheduler_priority", "Plugin priority", "插件优先级", "weeklyQuotaReserveEnabled", "weeklyQuotaReservePercent", "weeklyQuotaReserveUnlockWindow", "settings.weeklyQuotaReserveEnabled"} {
+	for _, want := range []string{"quota-bar", "editDialog", "logList", "openEdit", "exportLogs", "codex-quota-scheduler-logs.json", "maxLogEntries", "logRetention", "refreshOneQuota", "refreshStatus", "renderAccounts", "renderMetrics", "metricNextAuthID", "metricMonthlyMode", "metricLastSelected", "managementKey", "loadStatus", "MANAGEMENT_BASE", "/v0/management/plugins/codex-quota-scheduler", "authHeaders()", "localeSelect", "TRANSLATIONS", "codex-quota-scheduler-locale-v1", "Scheduler Settings", "Account Queue", "INLINE_TRANSLATIONS", "Reset credits", "Refresh Quota", `id="editSchedulerPriority"`, "account.schedulerPriority", "scheduler_priority", "Plugin priority", "插件优先级", "editWeeklyQuotaReserveEnabled", "editWeeklyQuotaReservePercent", "editWeeklyQuotaReserveUnlockHours", "weekly_quota_reserve", "edit.weeklyQuotaReserveEnabled"} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("html missing marker %q: %s", want, html)
 		}
@@ -1728,7 +1728,7 @@ func TestResourceExportImportRoundTrip(t *testing.T) {
 	store := NewPluginState(cfg)
 	store.SetAnnotations(AnnotationState{
 		Accounts: map[string]AccountAnnotation{
-			"auth:auth-1": {Alias: "A", Tags: []string{"team"}, GroupID: "1", SchedulerPriority: 9},
+			"auth:auth-1": {Alias: "A", Tags: []string{"team"}, GroupID: "1", SchedulerPriority: 9, WeeklyQuotaReserve: &WeeklyQuotaReservePolicy{Enabled: true, Percent: 15, UnlockHours: 3}},
 		},
 		Groups: map[string]GroupAnnotation{
 			"1": {Name: "group1"},
@@ -1764,6 +1764,10 @@ func TestResourceExportImportRoundTrip(t *testing.T) {
 	if got := imported.Annotations().Accounts["auth:auth-1"].SchedulerPriority; got != 9 {
 		t.Fatalf("imported scheduler priority = %d, want 9", got)
 	}
+	policy := imported.Annotations().Accounts["auth:auth-1"].WeeklyQuotaReserve
+	if policy == nil || !policy.Enabled || policy.Percent != 15 || policy.UnlockHours != 3 {
+		t.Fatalf("imported reserve policy = %#v", policy)
+	}
 }
 
 func TestManagementSettingsAndImportRejectNonChatGPTQuotaEndpoint(t *testing.T) {
@@ -1795,6 +1799,35 @@ func TestManagementSettingsAndImportRejectNonChatGPTQuotaEndpoint(t *testing.T) 
 	}
 	if store.Config().QuotaEndpoint != DefaultConfig().QuotaEndpoint {
 		t.Fatalf("import changed quota endpoint to %q", store.Config().QuotaEndpoint)
+	}
+}
+
+func TestManagementRejectsInvalidEnabledWeeklyQuotaReservePolicy(t *testing.T) {
+	dir := t.TempDir()
+	previousDefaultStatePath := defaultStatePath
+	defaultStatePath = func() string { return filepath.Join(dir, "state.json") }
+	t.Cleanup(func() { defaultStatePath = previousDefaultStatePath })
+
+	store := NewPluginState(DefaultConfig())
+	resp := HandleManagementRequest(store, pluginapi.ManagementRequest{
+		Method: http.MethodPatch,
+		Path:   "/plugins/codex-quota-scheduler/annotations/account",
+		Body:   []byte(`{"auth_id":"invalid","weekly_quota_reserve":{"enabled":true,"percent":0,"unlock_hours":5}}`),
+	}, time.Now())
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("patch StatusCode = %d, want %d; body=%s", resp.StatusCode, http.StatusBadRequest, resp.Body)
+	}
+	if _, exists := store.Annotations().Accounts["auth:invalid"]; exists {
+		t.Fatalf("invalid reserve policy mutated annotations: %#v", store.Annotations())
+	}
+
+	resp = HandleManagementRequest(store, pluginapi.ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/plugins/codex-quota-scheduler/import",
+		Body:   []byte(`{"config":{"HandleEnabled":true,"MonthlyMode":"expiry_order","QuotaRefreshInterval":1800000000000,"StaleAfter":18000000000000,"MaxRefreshConcurrency":1,"QuotaEndpoint":"https://chatgpt.com/backend-api/wham/usage","MaxLogEntries":200,"LogRetention":86400000000000},"accounts":{"auth:invalid":{"weekly_quota_reserve":{"enabled":true,"percent":20,"unlock_hours":0}}}}`),
+	}, time.Now())
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("import StatusCode = %d, want %d; body=%s", resp.StatusCode, http.StatusBadRequest, resp.Body)
 	}
 }
 

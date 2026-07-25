@@ -173,6 +173,23 @@ func (s *PluginState) IsAuthAdmitted(authID string) bool {
 	return ok
 }
 
+func (s *PluginState) AnnotationKeyForAuthID(authID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, account := range s.accounts {
+		if account.AuthID != authID {
+			continue
+		}
+		if key := ResolveAnnotationKey(account); key != "" {
+			return key
+		}
+	}
+	if authID == "" {
+		return ""
+	}
+	return "auth:" + authID
+}
+
 func (s *PluginState) ExecutionTokenCurrent(authID string, token ExecutionToken) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -810,6 +827,10 @@ func cloneAnnotationState(state AnnotationState) AnnotationState {
 
 func cloneAccountAnnotation(annotation AccountAnnotation) AccountAnnotation {
 	annotation.Tags = cloneStringSlice(annotation.Tags)
+	if annotation.WeeklyQuotaReserve != nil {
+		policy := *annotation.WeeklyQuotaReserve
+		annotation.WeeklyQuotaReserve = &policy
+	}
 	return annotation
 }
 

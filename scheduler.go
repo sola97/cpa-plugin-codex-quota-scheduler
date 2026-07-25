@@ -181,7 +181,7 @@ func buildOrderedAccounts(req pluginapi.SchedulerPickRequest, snapshot StateSnap
 			QueueStatus:               queueStatus,
 			Available:                 available,
 			UnavailableReason:         reason,
-			WeeklyQuotaReserveBlocked: weeklyQuotaReserveBlocks(account, snapshot.Config, now),
+			WeeklyQuotaReserveBlocked: weeklyQuotaReserveBlocks(account, now),
 			SortTime:                  sortTime,
 			Annotation:                account.Annotation,
 			selectionClass:            selectionClass,
@@ -220,7 +220,7 @@ func accountQueueState(account AccountState, now time.Time) (QueueStatus, bool, 
 	return accountQueueStateWithConfig(account, now, DefaultConfig())
 }
 
-func accountQueueStateWithConfig(account AccountState, now time.Time, cfg Config) (QueueStatus, bool, string, time.Time) {
+func accountQueueStateWithConfig(account AccountState, now time.Time, _ Config) (QueueStatus, bool, string, time.Time) {
 	if account.Refresh.AuthFailure {
 		return QueueStatusUnavailable, false, "auth_failure", time.Time{}
 	}
@@ -237,9 +237,6 @@ func accountQueueStateWithConfig(account AccountState, now time.Time, cfg Config
 	if circuit.EffectiveState == CircuitStateClosed && circuit.FailureCount > 0 && !circuit.NextProbeAt.IsZero() && circuit.NextProbeAt.After(now) {
 		return QueueStatusUnavailable, false, "quota_probe_wait", circuit.NextProbeAt
 	}
-	if weeklyQuotaReserveBlocks(account, cfg, now) {
-		return QueueStatusUnavailable, false, weeklyQuotaReserveReason, weeklyQuotaReserveUnlockAt(account, cfg)
-	}
 	switch account.Family {
 	case AccountFamilyWeekly:
 		if account.Quota.LongWindow == nil {
@@ -250,6 +247,9 @@ func accountQueueStateWithConfig(account AccountState, now time.Time, cfg Config
 		}
 		if windowExhausted(account.Quota.LongWindow, now) {
 			return QueueStatusLongWindowExhausted, false, "weekly_exhausted", account.Quota.LongWindow.ResetAt
+		}
+		if weeklyQuotaReserveBlocks(account, now) {
+			return QueueStatusUnavailable, false, weeklyQuotaReserveReason, weeklyQuotaReserveUnlockAt(account, now)
 		}
 		if account.TemporaryExhausted && (account.TemporaryResetAt.IsZero() || account.TemporaryResetAt.After(now)) {
 			return QueueStatusFiveHourExhausted, false, "temporary_exhausted", account.TemporaryResetAt

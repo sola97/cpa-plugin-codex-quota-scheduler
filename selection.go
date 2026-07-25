@@ -72,7 +72,7 @@ type SelectionResult struct {
 }
 
 func ClassifyAccount(a AccountView, now time.Time) AvailabilityClass {
-	if a.AuthBlocked || a.Circuit == CircuitOpen || a.TemporaryUnavailable || a.Trial != TrialNone || (a.WeeklyQuotaReserveBlocked && (a.WeeklyQuotaReserveUnlockAt.IsZero() || a.WeeklyQuotaReserveUnlockAt.After(now))) {
+	if a.AuthBlocked || a.Circuit == CircuitOpen || a.TemporaryUnavailable || a.Trial != TrialNone || weeklyQuotaReserveSnapshotBlocks(a, now) {
 		return Excluded
 	}
 	if a.Exhausted && a.ResetAt.After(now) {

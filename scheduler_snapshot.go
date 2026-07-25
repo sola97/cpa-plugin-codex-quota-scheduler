@@ -143,8 +143,8 @@ func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *Tri
 		Cache: cache, LastKnownAvailable: a.LastError == "", Exhausted: exhausted,
 		ResetAt: reset, AuthBlocked: a.Refresh.AuthFailure, Circuit: circuitClass,
 		TemporaryUnavailable:       a.TemporaryExhausted && a.TemporaryResetAt.After(now),
-		WeeklyQuotaReserveBlocked:  weeklyQuotaReserveBlocks(a, cfg, now),
-		WeeklyQuotaReserveUnlockAt: weeklyQuotaReserveUnlockAt(a, cfg),
+		WeeklyQuotaReserveBlocked:  weeklyQuotaReserveBlocks(a, now),
+		WeeklyQuotaReserveUnlockAt: weeklyQuotaReserveUnlockAt(a, now),
 		Trial:                      trial, Expiry: accountSortTime(a), RemainingQuota: remainingQuota(a),
 	}
 }
@@ -159,7 +159,7 @@ func hasWeeklyQuotaReserveCandidate(snapshot SchedulerSnapshot, candidates []Can
 		}
 	}
 	for _, account := range snapshot.Accounts {
-		if _, ok := eligible[account.ID]; ok && account.WeeklyQuotaReserveBlocked && (account.WeeklyQuotaReserveUnlockAt.IsZero() || account.WeeklyQuotaReserveUnlockAt.After(now)) {
+		if _, ok := eligible[account.ID]; ok && weeklyQuotaReserveSnapshotBlocks(account, now) {
 			return true
 		}
 	}
