@@ -137,6 +137,9 @@ func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *Tri
 	} else if circuit == CircuitStateHalfOpen {
 		circuitClass = CircuitHalfOpen
 	}
+	naturalResetAt := accountSortTime(a)
+	resetCreditExpiry := earliestAvailableResetCreditExpiry(a.Quota, now)
+	consumeBy, resetCreditPriority := accountConsumptionDeadline(naturalResetAt, resetCreditExpiry)
 	return AccountView{
 		ID: a.AuthID, AuthIndex: a.AuthIndex, Instance: a.Instance,
 		PluginPriority: a.Annotation.SchedulerPriority, Family: a.Family,
@@ -145,7 +148,12 @@ func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *Tri
 		TemporaryUnavailable:       a.TemporaryExhausted && a.TemporaryResetAt.After(now),
 		WeeklyQuotaReserveBlocked:  weeklyQuotaReserveBlocks(a, now),
 		WeeklyQuotaReserveUnlockAt: weeklyQuotaReserveUnlockAt(a, now),
-		Trial:                      trial, Expiry: accountSortTime(a), RemainingQuota: remainingQuota(a),
+		Trial:                      trial,
+		Expiry:                     naturalResetAt,
+		ConsumeBy:                  consumeBy,
+		ResetCreditExpiry:          resetCreditExpiry,
+		ResetCreditPriority:        resetCreditPriority,
+		RemainingQuota:             remainingQuota(a),
 	}
 }
 

@@ -55,6 +55,9 @@ type AccountView struct {
 	WeeklyQuotaReserveUnlockAt time.Time
 	Trial                      TrialState
 	Expiry                     time.Time
+	ConsumeBy                  time.Time
+	ResetCreditExpiry          time.Time
+	ResetCreditPriority        bool
 	RemainingQuota             float64
 }
 
@@ -141,14 +144,16 @@ func accountViewLess(a, b AccountView, mode MonthlyMode) bool {
 	if mode == MonthlyModePriority && a.Family != b.Family {
 		return a.Family == AccountFamilyMonthly
 	}
-	if !a.Expiry.Equal(b.Expiry) {
-		if a.Expiry.IsZero() {
+	aDeadline := accountViewConsumptionDeadline(a)
+	bDeadline := accountViewConsumptionDeadline(b)
+	if !aDeadline.Equal(bDeadline) {
+		if aDeadline.IsZero() {
 			return false
 		}
-		if b.Expiry.IsZero() {
+		if bDeadline.IsZero() {
 			return true
 		}
-		return a.Expiry.Before(b.Expiry)
+		return aDeadline.Before(bDeadline)
 	}
 	if a.RemainingQuota != b.RemainingQuota {
 		return a.RemainingQuota > b.RemainingQuota

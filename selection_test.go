@@ -79,11 +79,19 @@ func oracleBefore(a, b AccountView, mode MonthlyMode) bool {
 	if mode == MonthlyModePriority && a.Family != b.Family {
 		return a.Family == AccountFamilyMonthly
 	}
-	if a.Expiry.IsZero() != b.Expiry.IsZero() {
-		return !a.Expiry.IsZero()
+	aDeadline := a.Expiry
+	if !a.ConsumeBy.IsZero() {
+		aDeadline = a.ConsumeBy
 	}
-	if !a.Expiry.Equal(b.Expiry) {
-		return a.Expiry.Before(b.Expiry)
+	bDeadline := b.Expiry
+	if !b.ConsumeBy.IsZero() {
+		bDeadline = b.ConsumeBy
+	}
+	if aDeadline.IsZero() != bDeadline.IsZero() {
+		return !aDeadline.IsZero()
+	}
+	if !aDeadline.Equal(bDeadline) {
+		return aDeadline.Before(bDeadline)
 	}
 	if a.RemainingQuota != b.RemainingQuota {
 		return a.RemainingQuota > b.RemainingQuota

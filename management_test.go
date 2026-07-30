@@ -924,7 +924,7 @@ func TestDynamicAccountRenderingUsesChineseBaseText(t *testing.T) {
 func TestDynamicAccountRenderingShowsResetCreditExpiry(t *testing.T) {
 	store := NewPluginState(DefaultConfig())
 	page := renderStatusPageForTest(t, store)
-	for _, want := range []string{"resetCreditSummary", "reset_credits", "expires_at"} {
+	for _, want := range []string{"resetCreditSummary", "reset_credits", "expires_at", "主动重置优先", "reset_credit_priority", "resetCreditPrioritySummary"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("page missing reset credit expiry marker %q", want)
 		}
