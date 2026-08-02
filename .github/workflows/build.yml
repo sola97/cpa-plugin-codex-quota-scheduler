@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 env:
   PLUGIN_NAME: codex-quota-scheduler
@@ -96,6 +97,37 @@ jobs:
       - name: Build and package plugin
         run: make package VERSION="${VERSION}" GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}"
 
+      - name: Remove previous artifacts for this workflow  # codex-artifact-retention-cleanup
+        continue-on-error: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const currentRun = await github.rest.actions.getWorkflowRun({
+              owner,
+              repo,
+              run_id: context.runId
+            });
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              { owner, repo, per_page: 100 }
+            );
+            const previousArtifacts = artifacts.filter((artifact) =>
+              !artifact.expired &&
+              artifact.workflow_run &&
+              String(artifact.workflow_run.workflow_id) === String(currentRun.data.workflow_id) &&
+              String(artifact.workflow_run.id) !== String(context.runId)
+            );
+            for (const artifact of previousArtifacts) {
+              await github.rest.actions.deleteArtifact({
+                owner,
+                repo,
+                artifact_id: artifact.id
+              });
+              core.info(`Deleted previous artifact: ${artifact.name} (${artifact.id})`);
+            }
+            core.info(`Removed ${previousArtifacts.length} previous artifact(s)`);
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -105,6 +137,7 @@ jobs:
             dist/${{ env.ARCHIVE_NAME }}.sha256
           if-no-files-found: error
 
+          retention-days: 1
   build-windows-arm64:
     name: Build windows/arm64
     needs: test
@@ -158,6 +191,37 @@ jobs:
             -archive "dist/${ARCHIVE_NAME}" \
             -checksum "dist/${ARCHIVE_NAME}.sha256"
 
+      - name: Remove previous artifacts for this workflow  # codex-artifact-retention-cleanup
+        continue-on-error: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const currentRun = await github.rest.actions.getWorkflowRun({
+              owner,
+              repo,
+              run_id: context.runId
+            });
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              { owner, repo, per_page: 100 }
+            );
+            const previousArtifacts = artifacts.filter((artifact) =>
+              !artifact.expired &&
+              artifact.workflow_run &&
+              String(artifact.workflow_run.workflow_id) === String(currentRun.data.workflow_id) &&
+              String(artifact.workflow_run.id) !== String(context.runId)
+            );
+            for (const artifact of previousArtifacts) {
+              await github.rest.actions.deleteArtifact({
+                owner,
+                repo,
+                artifact_id: artifact.id
+              });
+              core.info(`Deleted previous artifact: ${artifact.name} (${artifact.id})`);
+            }
+            core.info(`Removed ${previousArtifacts.length} previous artifact(s)`);
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -167,6 +231,7 @@ jobs:
             dist/${{ env.ARCHIVE_NAME }}.sha256
           if-no-files-found: error
 
+          retention-days: 1
   build-freebsd:
     name: Build freebsd/amd64
     needs: test
@@ -220,6 +285,37 @@ jobs:
             -archive "dist/${ARCHIVE_NAME}" \
             -checksum "dist/${ARCHIVE_NAME}.sha256"
 
+      - name: Remove previous artifacts for this workflow  # codex-artifact-retention-cleanup
+        continue-on-error: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const currentRun = await github.rest.actions.getWorkflowRun({
+              owner,
+              repo,
+              run_id: context.runId
+            });
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              { owner, repo, per_page: 100 }
+            );
+            const previousArtifacts = artifacts.filter((artifact) =>
+              !artifact.expired &&
+              artifact.workflow_run &&
+              String(artifact.workflow_run.workflow_id) === String(currentRun.data.workflow_id) &&
+              String(artifact.workflow_run.id) !== String(context.runId)
+            );
+            for (const artifact of previousArtifacts) {
+              await github.rest.actions.deleteArtifact({
+                owner,
+                repo,
+                artifact_id: artifact.id
+              });
+              core.info(`Deleted previous artifact: ${artifact.name} (${artifact.id})`);
+            }
+            core.info(`Removed ${previousArtifacts.length} previous artifact(s)`);
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -229,6 +325,7 @@ jobs:
             dist/${{ env.ARCHIVE_NAME }}.sha256
           if-no-files-found: error
 
+          retention-days: 1
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
