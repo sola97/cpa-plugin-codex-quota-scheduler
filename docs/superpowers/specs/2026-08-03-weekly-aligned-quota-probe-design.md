@@ -295,4 +295,8 @@ quota parsing, persistence, concurrency, and user-visible management state.
 The local CGO toolchain must be able to compile the package before interpreting
 those tests as meaningful.
 
-No production code is part of this design-review change.
+Implementation notes: Probe Workers return an observed activation effect; the
+Coordinator applies it only after binding-token validation. This preserves a
+sent attempt for verify-first recovery when an account changes while the
+sequence is in flight, and keeps quota facts synchronized without changing
+circuit or trial state.
