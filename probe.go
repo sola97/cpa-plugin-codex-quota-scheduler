@@ -6,11 +6,12 @@ import (
 )
 
 const (
-	resetProbeAfterResetDelay = 10 * time.Minute
-	resetProbeCloseThreshold  = 3 * time.Minute
-	codexResetProbeEndpoint   = "https://chatgpt.com/backend-api/codex/responses/compact"
-	codexResetProbeModel      = "gpt-5.4-mini"
-	resetProbePayload         = `{"model":"gpt-5.4-mini","instructions":"","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}]}`
+	resetProbeAfterResetDelay    = 10 * time.Minute
+	resetProbeCloseThreshold     = 3 * time.Minute
+	codexResetProbeEndpoint      = "https://chatgpt.com/backend-api/codex/responses/compact"
+	codexResetProbeModel         = "gpt-5.4-mini"
+	resetProbePayload            = `{"model":"gpt-5.4-mini","instructions":"","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}]}`
+	weeklyActivationProbePayload = `{"model":"gpt-5.4-mini","instructions":"","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"你好"}]}]}`
 )
 
 func probeWindowDuration(window QuotaWindow) (time.Duration, bool) {
@@ -174,4 +175,8 @@ func jsonNumberPathPositive(root any, path ...string) bool {
 
 func resetProbePayloadBytes() []byte {
 	return []byte(resetProbePayload)
+}
+
+func weeklyActivationProbePayloadBytes() []byte {
+	return []byte(weeklyActivationProbePayload)
 }

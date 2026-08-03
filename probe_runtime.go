@@ -38,7 +38,13 @@ func (r *QuotaRefresher) initProbeRuntime() error {
 	r.probeWAL = NewProbeWAL(r.runtimeStore)
 	r.probeFence = NewFenceAllocator(r.runtimeStore, state, nil)
 	r.coordinator.opts.AllocateReadSeq = r.probeFence.Next
-	return r.bootstrapProbeWindows()
+	if err := r.bootstrapProbeWindows(); err != nil {
+		return err
+	}
+	if err := r.bootstrapWeeklyActivationStates(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *QuotaRefresher) bootstrapProbeWindows() error {
@@ -151,13 +157,21 @@ func (r *QuotaRefresher) reconcileProbeOrphans(persisted PersistentState, active
 	for i := range persisted.ProbeAttempts {
 		keys[i] = struct{}{}
 	}
+	for i := range persisted.WeeklyActivationProbes {
+		keys[i] = struct{}{}
+	}
 	var firstErr error
 	for i := range keys {
 		if _, ok := active[i]; ok {
 			continue
 		}
 		r.probeController.Advance(i, ProbeEvent{Kind: ProbeEventInstanceRemoved, Now: r.now()})
-		_, err := r.runtimeStore.Update(func(s *PersistentState) error { delete(s.ProbeWindows, i); delete(s.ProbeAttempts, i); return nil })
+		_, err := r.runtimeStore.Update(func(s *PersistentState) error {
+			delete(s.ProbeWindows, i)
+			delete(s.ProbeAttempts, i)
+			delete(s.WeeklyActivationProbes, i)
+			return nil
+		})
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -285,6 +299,9 @@ func (r *QuotaRefresher) RunProbeDueOnce(ctx context.Context) error {
 	if err := r.bootstrapProbeWindows(); err != nil {
 		return err
 	}
+	if err := r.bootstrapWeeklyActivationStates(); err != nil {
+		return err
+	}
 	now := r.now()
 	persisted, err := r.runtimeStore.PersistentSnapshot()
 	if err != nil {
@@ -302,6 +319,9 @@ func (r *QuotaRefresher) RunProbeDueOnce(ctx context.Context) error {
 		firstErr = err
 	}
 	for authID, b := range bindings {
+		if attempt, ok := persisted.ProbeAttempts[b.Instance]; ok && attempt.Purpose == ProbePurposeWeeklyActivation && nonterminalProbeAttempt(attempt) {
+			continue
+		}
 		if attempt, ok := persisted.ProbeAttempts[b.Instance]; ok && (attempt.Phase == ProbeAttemptSending || attempt.Phase == ProbeAttemptSent || attempt.Phase == ProbeAttemptSentUnknown) {
 			continue // recovery owns every nonterminal send, suppression expiry never authorizes resend
 		}
@@ -361,6 +381,80 @@ func (r *QuotaRefresher) RunProbeDueOnce(ctx context.Context) error {
 				firstErr = result.Err
 			}
 			continue
+		}
+	}
+	weeklyPersisted, snapshotErr := r.runtimeStore.PersistentSnapshot()
+	if snapshotErr != nil {
+		if firstErr == nil {
+			firstErr = snapshotErr
+		}
+	} else if err := r.runWeeklyActivationDue(ctx, bindings, weeklyPersisted); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
+
+func (r *QuotaRefresher) runWeeklyActivationDue(ctx context.Context, bindings map[string]RuntimeBinding, persisted PersistentState) error {
+	if r == nil || r.runtimeStore == nil || r.state == nil || !r.state.Config().EnableWeeklyActivationProbe {
+		return nil
+	}
+	now := r.now()
+	var firstErr error
+	for authID, binding := range bindings {
+		activation, ok := persisted.WeeklyActivationProbes[binding.Instance]
+		if !ok || !weeklyActivationStateDue(activation, now) || binding.AuthBlocked {
+			continue
+		}
+		if existing, ok := persisted.ProbeAttempts[binding.Instance]; ok && nonterminalProbeAttempt(existing) {
+			continue
+		}
+		var attempt ProbeAttempt
+		claimed, err := r.runtimeStore.Update(func(state *PersistentState) error {
+			current, exists := state.WeeklyActivationProbes[binding.Instance]
+			if !exists || !weeklyActivationStateDue(current, r.now()) {
+				return nil
+			}
+			if existing, ok := state.ProbeAttempts[binding.Instance]; ok && nonterminalProbeAttempt(existing) {
+				attempt = existing
+				return nil
+			}
+			state.ProbeAttemptSeq++
+			attempt = ProbeAttempt{
+				Instance:        binding.Instance,
+				AttemptID:       fmt.Sprintf("weekly-probe-%d-%d", binding.Instance, state.ProbeAttemptSeq),
+				Purpose:         ProbePurposeWeeklyActivation,
+				Phase:           ProbeAttemptPrepared,
+				CreatedAt:       now,
+				VerifyNotBefore: now,
+				SuppressUntil:   now.Add(weeklyActivationCooldownTime),
+			}
+			state.ProbeAttempts[binding.Instance] = attempt
+			return nil
+		})
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		persistedAttempt, exists := claimed.ProbeAttempts[binding.Instance]
+		if !exists || persistedAttempt.AttemptID != attempt.AttemptID || attempt.Purpose != ProbePurposeWeeklyActivation || attempt.Phase != ProbeAttemptPrepared {
+			continue
+		}
+		result := r.coordinator.SubmitTyped(Intent{
+			AuthID:      authID,
+			Instance:    binding.Instance,
+			Generation:  TierGeneration(binding.Generation),
+			Class:       OperationProbeSequence,
+			Source:      SourceProbeActivation,
+			AttemptID:   attempt.AttemptID,
+			Token:       binding.ExecutionToken(0),
+			Login:       binding.Login,
+			Fingerprint: binding.Fingerprint,
+			Payload:     probeSequencePayload{Binding: binding, Attempt: attempt},
+		}).Await(ctx)
+		if result.Err != nil && firstErr == nil {
+			firstErr = result.Err
 		}
 	}
 	return firstErr
@@ -438,7 +532,8 @@ func (r *QuotaRefresher) RunProbeRecoveryOnce(ctx context.Context) error {
 			}
 			continue
 		}
-		intent.Payload = probeSequencePayload{Binding: binding, Windows: windows, Attempt: st.ProbeAttempts[intent.Instance], Recovery: true}
+		attempt := st.ProbeAttempts[intent.Instance]
+		intent.Payload = probeSequencePayload{Binding: binding, Windows: windows, Attempt: attempt, Recovery: true}
 		result := r.coordinator.SubmitTyped(intent).Await(ctx)
 		if result.Err != nil {
 			if firstErr == nil {
@@ -469,6 +564,10 @@ func (r *QuotaRefresher) recoverPreparedProbeAttempts() error {
 		if attempt.Phase != ProbeAttemptPrepared {
 			continue
 		}
+		if attempt.Purpose == ProbePurposeWeeklyActivation {
+			changed = true
+			continue
+		}
 		for _, kind := range attempt.Windows {
 			window, ok := r.probeController.Window(instance, kind)
 			if !ok {
@@ -491,6 +590,14 @@ func (r *QuotaRefresher) recoverPreparedProbeAttempts() error {
 		persisted.ProbeWindows = windows
 		for instance, attempt := range persisted.ProbeAttempts {
 			if attempt.Phase == ProbeAttemptPrepared {
+				if attempt.Purpose == ProbePurposeWeeklyActivation {
+					activation := persisted.WeeklyActivationProbes[instance]
+					activation.State = WeeklyActivationRetryWait
+					activation.Attempts++
+					activation.NextCheckAt = now.Add(probeBackoff(activation.Attempts))
+					activation.LastError = "prepared weekly activation attempt was recovered before sending"
+					persisted.WeeklyActivationProbes[instance] = activation
+				}
 				delete(persisted.ProbeAttempts, instance)
 			}
 		}
@@ -504,25 +611,10 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 	switch intent.Class {
 	case OperationProbeSequence:
 		p := intent.Payload.(probeSequencePayload)
-		attempt := p.Attempt
-		read := func() (probeReadResult, error) {
-			var auth pluginapi.HostAuthGetResponse
-			if err := held.DoHTTP(ctx, func(context.Context) error { var e error; auth, e = r.host.GetAuth(p.Binding.AuthIndex); return e }); err != nil {
-				return probeReadResult{}, err
-			}
-			credentials, err := ExtractCodexCredentials(auth.JSON)
-			if err != nil {
-				return probeReadResult{}, err
-			}
-			if credentials.ChatGPTAccountID == "" {
-				return probeReadResult{}, ErrAccountIdentityUnresolved
-			}
-			if r.runtimeRoster().Provisional && NewCredentialFingerprint(credentials.ChatGPTAccountID, credentials.RefreshToken, p.Binding.AuthIndex) != p.Binding.Fingerprint {
-				return probeReadResult{}, ErrProvisionalFingerprintMismatch
-			}
-			quota, err := r.typedFetchQuota(ctx, held, credentials)
-			return probeReadResult{Quota: quota, Credentials: credentials}, err
+		if p.Attempt.Purpose == ProbePurposeWeeklyActivation {
+			return r.runWeeklyActivationSequence(ctx, intent, held, p)
 		}
+		attempt := p.Attempt
 		fail := func(err error, sent bool) OperationResult {
 			if r.runtimeRoster().Provisional && (errors.Is(err, ErrProvisionalFingerprintMismatch) || errors.Is(err, ErrCapabilityB)) {
 				r.clearProvisionalPermit()
@@ -584,7 +676,7 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			if seq <= attempt.SendFenceSeq {
 				return fail(errors.New("verify read did not start after send fence"), true)
 			}
-			vr, err := read()
+			vr, err := r.readProbeQuota(ctx, held, p.Binding)
 			if err != nil {
 				return fail(err, true)
 			}
@@ -606,7 +698,7 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 		if err != nil {
 			return fail(err, false)
 		}
-		pre, err := read()
+		pre, err := r.readProbeQuota(ctx, held, p.Binding)
 		if err != nil {
 			_ = r.probeWAL.Complete(intent.Instance)
 			return fail(err, false)
@@ -673,7 +765,7 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 		if seq <= fence {
 			return fail(errors.New("verify read did not start after send fence"), true)
 		}
-		vr, err := read()
+		vr, err := r.readProbeQuota(ctx, held, p.Binding)
 		if err != nil {
 			return fail(err, true)
 		}
@@ -724,6 +816,238 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 		res.Value = probeReadResult{Quota: quota, Credentials: credentials}
 	}
 	return res
+}
+
+func (r *QuotaRefresher) readProbeQuota(ctx context.Context, held *HeldLease, binding RuntimeBinding) (probeReadResult, error) {
+	var auth pluginapi.HostAuthGetResponse
+	if err := held.DoHTTP(ctx, func(context.Context) error {
+		var err error
+		auth, err = r.host.GetAuth(binding.AuthIndex)
+		return err
+	}); err != nil {
+		return probeReadResult{}, err
+	}
+	credentials, err := ExtractCodexCredentials(auth.JSON)
+	if err != nil {
+		return probeReadResult{}, err
+	}
+	if credentials.ChatGPTAccountID == "" {
+		return probeReadResult{}, ErrAccountIdentityUnresolved
+	}
+	if r.runtimeRoster().Provisional && NewCredentialFingerprint(credentials.ChatGPTAccountID, credentials.RefreshToken, binding.AuthIndex) != binding.Fingerprint {
+		return probeReadResult{}, ErrProvisionalFingerprintMismatch
+	}
+	quota, err := r.typedFetchQuota(ctx, held, credentials)
+	return probeReadResult{Quota: quota, Credentials: credentials}, err
+}
+
+func (r *QuotaRefresher) runWeeklyActivationSequence(ctx context.Context, intent Intent, held *HeldLease, p probeSequencePayload) OperationResult {
+	res := OperationResult{Token: intent.Token, Login: intent.Login, Fingerprint: intent.Fingerprint}
+	attempt := p.Attempt
+	fail := func(err error, sent bool) OperationResult {
+		if r.runtimeRoster().Provisional && (errors.Is(err, ErrProvisionalFingerprintMismatch) || errors.Is(err, ErrCapabilityB)) {
+			r.clearProvisionalPermit()
+			r.rosterMu.Lock()
+			if r.roster.Provisional {
+				r.roster.BackgroundAllowed = false
+				r.roster.Health = RosterWaiting
+			}
+			r.rosterMu.Unlock()
+			_ = r.persistProbeRosterHold()
+			return OperationResult{Token: intent.Token, Err: err}
+		}
+		if status, ok := err.(quotaStatusError); ok && status.status == http.StatusUnauthorized && r.bindings != nil {
+			_ = r.bindings.MarkAuthBlocked(intent.AuthID)
+		}
+		failureErr := err
+		if sent {
+			until := attempt.SuppressUntil
+			if until.IsZero() {
+				until = r.now().Add(weeklyActivationCooldownTime)
+			}
+			if stateErr := r.markWeeklyActivationCooldown(intent.Instance, until, err); stateErr != nil {
+				failureErr = errors.Join(failureErr, stateErr)
+			}
+			if r.probeWAL != nil {
+				if walErr := r.probeWAL.PersistSentUnknown(intent.Instance, until); walErr != nil {
+					failureErr = errors.Join(failureErr, walErr)
+				}
+			}
+		} else {
+			if stateErr := r.markWeeklyActivationRetry(intent.Instance, err); stateErr != nil {
+				failureErr = errors.Join(failureErr, stateErr)
+			}
+			if r.probeWAL != nil {
+				if walErr := r.probeWAL.Complete(intent.Instance); walErr != nil {
+					failureErr = errors.Join(failureErr, walErr)
+				}
+			}
+		}
+		return OperationResult{Token: intent.Token, Err: failureErr}
+	}
+	complete := func() error {
+		if r.probeWAL == nil {
+			return nil
+		}
+		return r.probeWAL.Complete(intent.Instance)
+	}
+
+	if p.Recovery {
+		if attempt.SendFenceSeq == 0 {
+			attempt.SendFenceSeq = intent.StartedAfter
+		}
+		if attempt.SendFenceSeq == 0 {
+			return fail(errors.New("weekly activation recovery missing send fence"), true)
+		}
+		seq, err := r.probeFence.Next()
+		if err != nil {
+			return fail(err, true)
+		}
+		if seq <= attempt.SendFenceSeq {
+			return fail(errors.New("weekly activation verify read did not start after send fence"), true)
+		}
+		verified, err := r.readProbeQuota(ctx, held, p.Binding)
+		if err != nil {
+			return fail(err, true)
+		}
+		resetAt, aligned := weeklyActivationResetAt(verified.Quota)
+		if !aligned || !weeklyResetAligned(resetAt, r.now()) {
+			if err = r.markWeeklyActivationManual(intent.Instance, resetAt, nil); err != nil {
+				return fail(err, true)
+			}
+			if err = complete(); err != nil {
+				return fail(err, true)
+			}
+			res.ReadStartSeq, res.Value = seq, verified
+			return res
+		}
+		if !attempt.UsageEvidence && !weeklyActivationPostSendEvidence(verified.Quota) {
+			verificationErr := errors.New("weekly activation verification did not produce positive usage evidence")
+			if err = r.markWeeklyActivationRetry(intent.Instance, verificationErr); err != nil {
+				return fail(err, true)
+			}
+			if err = complete(); err != nil {
+				return fail(err, true)
+			}
+			return OperationResult{Token: intent.Token, Err: verificationErr, Value: verified, ReadStartSeq: seq}
+		}
+		if err = r.markWeeklyActivationConfirmed(intent.Instance, resetAt, probeAttemptSentAtOrNow(attempt, r.now())); err != nil {
+			return fail(err, true)
+		}
+		if err = complete(); err != nil {
+			return fail(err, true)
+		}
+		res.ReadStartSeq, res.Value = seq, verified
+		return res
+	}
+
+	pre, err := r.readProbeQuota(ctx, held, p.Binding)
+	if err != nil {
+		return fail(err, false)
+	}
+	if !weeklyActivationEligible(pre.Quota, r.now()) {
+		if err = r.syncWeeklyActivationState(intent.Instance, pre.Quota, false); err != nil {
+			return fail(err, false)
+		}
+		if err = complete(); err != nil {
+			return fail(err, false)
+		}
+		res.Value = pre
+		return res
+	}
+	fence, err := r.probeFence.Next()
+	if err != nil {
+		return fail(err, false)
+	}
+	attempt.Purpose = ProbePurposeWeeklyActivation
+	attempt.SendFenceSeq = fence
+	attempt.CreatedAt = r.now()
+	attempt.VerifyNotBefore = attempt.CreatedAt.Add(3 * time.Second)
+	attempt.SuppressUntil = attempt.CreatedAt.Add(weeklyActivationCooldownTime)
+	attempt.UsageEvidence = false
+	if err = r.probeWAL.PersistSending(attempt); err != nil {
+		return fail(err, false)
+	}
+	held.MarkProbeSent(attempt.SuppressUntil)
+	usageEvidence := false
+	err = held.DoHTTP(ctx, func(context.Context) error {
+		return r.probeWAL.ExecuteSend(func() error {
+			resp, sendErr := r.doBackgroundHTTPRequest(pluginapi.HTTPRequest{
+				Method: http.MethodPost,
+				URL:    codexResetProbeEndpoint,
+				Headers: http.Header{
+					"Authorization":      []string{"Bearer " + pre.Credentials.AccessToken},
+					"Chatgpt-Account-Id": []string{pre.Credentials.ChatGPTAccountID},
+					"Content-Type":       []string{"application/json"},
+				},
+				Body: weeklyActivationProbePayloadBytes(),
+			}, true)
+			if sendErr != nil {
+				return sendErr
+			}
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				return quotaStatusError{status: resp.StatusCode, body: resp.Body}
+			}
+			usageEvidence = resetProbeUsageEvidence(resp.Body)
+			return nil
+		})
+	})
+	if err != nil {
+		return fail(err, true)
+	}
+	if err = r.probeWAL.PersistSent(intent.Instance, r.now(), usageEvidence); err != nil {
+		return fail(err, true)
+	}
+	if err = held.WaitPropagation(ctx, 3*time.Second); err != nil {
+		return fail(err, true)
+	}
+	seq, err := r.probeFence.Next()
+	if err != nil {
+		return fail(err, true)
+	}
+	if seq <= fence {
+		return fail(errors.New("weekly activation verify read did not start after send fence"), true)
+	}
+	verified, err := r.readProbeQuota(ctx, held, p.Binding)
+	if err != nil {
+		return fail(err, true)
+	}
+	resetAt, aligned := weeklyActivationResetAt(verified.Quota)
+	if !aligned || !weeklyResetAligned(resetAt, r.now()) {
+		if err = r.markWeeklyActivationManual(intent.Instance, resetAt, nil); err != nil {
+			return fail(err, true)
+		}
+		if err = complete(); err != nil {
+			return fail(err, true)
+		}
+		res.ReadStartSeq, res.Value = seq, verified
+		return res
+	}
+	if !usageEvidence && !weeklyActivationPostSendEvidence(verified.Quota) {
+		verificationErr := errors.New("weekly activation response did not produce positive usage evidence")
+		if err = r.markWeeklyActivationRetry(intent.Instance, verificationErr); err != nil {
+			return fail(err, true)
+		}
+		if err = complete(); err != nil {
+			return fail(err, true)
+		}
+		return OperationResult{Token: intent.Token, Err: verificationErr, Value: verified, ReadStartSeq: seq}
+	}
+	if err = r.markWeeklyActivationConfirmed(intent.Instance, resetAt, r.now()); err != nil {
+		return fail(err, true)
+	}
+	if err = complete(); err != nil {
+		return fail(err, true)
+	}
+	res.ReadStartSeq, res.Value = seq, verified
+	return res
+}
+
+func probeAttemptSentAtOrNow(a ProbeAttempt, now time.Time) time.Time {
+	if a.SentAt != nil && !a.SentAt.IsZero() {
+		return *a.SentAt
+	}
+	return now
 }
 
 func (r *QuotaRefresher) typedFetchQuota(ctx context.Context, held *HeldLease, credentials CodexCredentials) (ParsedQuota, error) {

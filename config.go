@@ -37,6 +37,7 @@ type Config struct {
 	Fallback                        FallbackMode
 	EnableUsageFeedback             bool
 	EnableResetProbe                bool
+	EnableWeeklyActivationProbe     bool
 	ProbeOnProvisionalRoster        bool
 	MaxRefreshConcurrency           int
 	QuotaEndpoint                   string
@@ -71,6 +72,7 @@ type rawConfig struct {
 	Fallback                        string `yaml:"fallback"`
 	EnableUsageFeedback             *bool  `yaml:"enable_usage_feedback"`
 	EnableResetProbe                *bool  `yaml:"enable_reset_probe"`
+	EnableWeeklyActivationProbe     *bool  `yaml:"enable_weekly_activation_probe"`
 	ProbeOnProvisionalRoster        *bool  `yaml:"probe_on_provisional_roster"`
 	MaxRefreshConcurrency           *int   `yaml:"max_refresh_concurrency"`
 	QuotaEndpoint                   string `yaml:"quota_endpoint"`
@@ -94,6 +96,7 @@ func DefaultConfig() Config {
 		Fallback:                        FallbackFillFirst,
 		EnableUsageFeedback:             true,
 		EnableResetProbe:                false,
+		EnableWeeklyActivationProbe:     false,
 		MaxRefreshConcurrency:           1,
 		QuotaEndpoint:                   chatGPTQuotaEndpoint,
 		RefreshActiveWindow:             time.Hour,
@@ -203,6 +206,9 @@ func DecodeConfig(raw []byte) (Config, error) {
 	}
 	if decoded.EnableResetProbe != nil {
 		cfg.EnableResetProbe = *decoded.EnableResetProbe
+	}
+	if decoded.EnableWeeklyActivationProbe != nil {
+		cfg.EnableWeeklyActivationProbe = *decoded.EnableWeeklyActivationProbe
 	}
 	if decoded.ProbeOnProvisionalRoster != nil {
 		cfg.ProbeOnProvisionalRoster = *decoded.ProbeOnProvisionalRoster

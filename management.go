@@ -20,6 +20,7 @@ const managementBasePath = "/plugins/" + PluginID
 var managementRefreshSoon = func() {}
 var managementRefreshOneSoon = func(authID string) {}
 var managementProvisionalRiskChanged = func(bool) {}
+var managementWeeklyActivationChanged = func(bool) {}
 
 type StatusPayload struct {
 	PluginID              string                 `json:"plugin_id"`
@@ -86,6 +87,7 @@ type SettingsPayload struct {
 	StaleAfter                      string      `json:"stale_after"`
 	EnableUsageFeedback             bool        `json:"enable_usage_feedback"`
 	EnableResetProbe                bool        `json:"enable_reset_probe"`
+	EnableWeeklyActivationProbe     bool        `json:"enable_weekly_activation_probe"`
 	ProbeOnProvisionalRoster        bool        `json:"probe_on_provisional_roster"`
 	MaxRefreshConcurrency           int         `json:"max_refresh_concurrency"`
 	QuotaEndpoint                   string      `json:"quota_endpoint"`
@@ -101,36 +103,37 @@ type SettingsPayload struct {
 }
 
 type StatusAccount struct {
-	Rank                         int                `json:"rank"`
-	AuthID                       string             `json:"auth_id"`
-	Alias                        string             `json:"alias,omitempty"`
-	Notes                        string             `json:"notes,omitempty"`
-	GroupID                      string             `json:"group_id,omitempty"`
-	Group                        string             `json:"group,omitempty"`
-	GroupNotes                   string             `json:"group_notes,omitempty"`
-	Tags                         []string           `json:"tags,omitempty"`
-	CPAPriority                  int                `json:"cpa_priority"`
-	SchedulerPriority            int                `json:"scheduler_priority"`
-	Family                       AccountFamily      `json:"family"`
-	QueueStatus                  QueueStatus        `json:"queue_status"`
-	Available                    bool               `json:"available"`
-	UnavailableReason            string             `json:"unavailable_reason,omitempty"`
-	ResetExpiry                  time.Time          `json:"reset_expiry,omitempty"`
-	ResetExpiryText              string             `json:"reset_expiry_text,omitempty"`
-	CacheAge                     string             `json:"cache_age,omitempty"`
-	CacheAgeSeconds              int64              `json:"cache_age_seconds,omitempty"`
-	LastError                    string             `json:"last_error,omitempty"`
-	RefreshDueReason             string             `json:"refresh_due_reason,omitempty"`
-	NextRetryText                string             `json:"next_retry_text,omitempty"`
-	AuthFailure                  bool               `json:"auth_failure"`
-	StatusNote                   string             `json:"status_note,omitempty"`
-	FiveHour                     StatusWindow       `json:"five_hour"`
-	LongWindow                   StatusWindow       `json:"long_window"`
-	Circuit                      StatusCircuit      `json:"circuit"`
-	ResetCreditsAvailableCount   *int               `json:"reset_credits_available_count,omitempty"`
-	ResetCreditsTotalEarnedCount *int               `json:"reset_credits_total_earned_count,omitempty"`
-	ResetCredits                 []ResetCredit      `json:"reset_credits,omitempty"`
-	ResetProbes                  []StatusResetProbe `json:"reset_probes,omitempty"`
+	Rank                         int                          `json:"rank"`
+	AuthID                       string                       `json:"auth_id"`
+	Alias                        string                       `json:"alias,omitempty"`
+	Notes                        string                       `json:"notes,omitempty"`
+	GroupID                      string                       `json:"group_id,omitempty"`
+	Group                        string                       `json:"group,omitempty"`
+	GroupNotes                   string                       `json:"group_notes,omitempty"`
+	Tags                         []string                     `json:"tags,omitempty"`
+	CPAPriority                  int                          `json:"cpa_priority"`
+	SchedulerPriority            int                          `json:"scheduler_priority"`
+	Family                       AccountFamily                `json:"family"`
+	QueueStatus                  QueueStatus                  `json:"queue_status"`
+	Available                    bool                         `json:"available"`
+	UnavailableReason            string                       `json:"unavailable_reason,omitempty"`
+	ResetExpiry                  time.Time                    `json:"reset_expiry,omitempty"`
+	ResetExpiryText              string                       `json:"reset_expiry_text,omitempty"`
+	CacheAge                     string                       `json:"cache_age,omitempty"`
+	CacheAgeSeconds              int64                        `json:"cache_age_seconds,omitempty"`
+	LastError                    string                       `json:"last_error,omitempty"`
+	RefreshDueReason             string                       `json:"refresh_due_reason,omitempty"`
+	NextRetryText                string                       `json:"next_retry_text,omitempty"`
+	AuthFailure                  bool                         `json:"auth_failure"`
+	StatusNote                   string                       `json:"status_note,omitempty"`
+	FiveHour                     StatusWindow                 `json:"five_hour"`
+	LongWindow                   StatusWindow                 `json:"long_window"`
+	Circuit                      StatusCircuit                `json:"circuit"`
+	ResetCreditsAvailableCount   *int                         `json:"reset_credits_available_count,omitempty"`
+	ResetCreditsTotalEarnedCount *int                         `json:"reset_credits_total_earned_count,omitempty"`
+	ResetCredits                 []ResetCredit                `json:"reset_credits,omitempty"`
+	ResetProbes                  []StatusResetProbe           `json:"reset_probes,omitempty"`
+	WeeklyActivationProbe        *StatusWeeklyActivationProbe `json:"weekly_activation_probe,omitempty"`
 }
 
 type StatusResetProbe struct {
@@ -142,6 +145,16 @@ type StatusResetProbe struct {
 	VerifiedAt  string           `json:"verified_at,omitempty"`
 	Attempts    int              `json:"attempts,omitempty"`
 	Error       string           `json:"error,omitempty"`
+}
+
+type StatusWeeklyActivationProbe struct {
+	State         WeeklyActivationState `json:"state"`
+	WeeklyResetAt string                `json:"weekly_reset_at,omitempty"`
+	CooldownUntil string                `json:"cooldown_until,omitempty"`
+	NextCheckAt   string                `json:"next_check_at,omitempty"`
+	LastProbeAt   string                `json:"last_probe_at,omitempty"`
+	Attempts      int                   `json:"attempts,omitempty"`
+	LastError     string                `json:"last_error,omitempty"`
 }
 
 type StatusCircuit struct {
@@ -305,6 +318,7 @@ func SettingsFromConfig(cfg Config) SettingsPayload {
 		StaleAfter:                      cfg.StaleAfter.String(),
 		EnableUsageFeedback:             cfg.EnableUsageFeedback,
 		EnableResetProbe:                cfg.EnableResetProbe,
+		EnableWeeklyActivationProbe:     cfg.EnableWeeklyActivationProbe,
 		ProbeOnProvisionalRoster:        cfg.ProbeOnProvisionalRoster,
 		MaxRefreshConcurrency:           cfg.MaxRefreshConcurrency,
 		QuotaEndpoint:                   cfg.QuotaEndpoint,
@@ -345,6 +359,7 @@ func ConfigFromSettings(base Config, payload SettingsPayload) (Config, error) {
 	cfg.HandleEnabled = payload.HandleEnabled
 	cfg.EnableUsageFeedback = payload.EnableUsageFeedback
 	cfg.EnableResetProbe = payload.EnableResetProbe
+	cfg.EnableWeeklyActivationProbe = payload.EnableWeeklyActivationProbe
 	cfg.ProbeOnProvisionalRoster = payload.ProbeOnProvisionalRoster
 	if payload.MaxRefreshConcurrency <= 0 {
 		return Config{}, jsonError("max_refresh_concurrency must be positive")
@@ -433,6 +448,7 @@ func handlePutSettings(store *PluginState, req pluginapi.ManagementRequest, now 
 
 func saveSettingsPayload(store *PluginState, payload SettingsPayload) pluginapi.ManagementResponse {
 	previousRisk := store.Config().ProbeOnProvisionalRoster
+	previousWeeklyActivation := store.Config().EnableWeeklyActivationProbe
 	cfg, err := ConfigFromSettings(store.Config(), payload)
 	if err != nil {
 		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -446,6 +462,9 @@ func saveSettingsPayload(store *PluginState, payload SettingsPayload) pluginapi.
 	currentConfig.Store(cfg)
 	if cfg.ProbeOnProvisionalRoster != previousRisk {
 		managementProvisionalRiskChanged(cfg.ProbeOnProvisionalRoster)
+	}
+	if cfg.EnableWeeklyActivationProbe != previousWeeklyActivation {
+		managementWeeklyActivationChanged(cfg.EnableWeeklyActivationProbe)
 	}
 	return jsonManagementResponse(http.StatusOK, SettingsFromConfig(cfg))
 }
@@ -494,12 +513,16 @@ func handleImportState(store *PluginState, body []byte, now time.Time) pluginapi
 	if _, err := validateQuotaEndpoint(state.Config.QuotaEndpoint); err != nil {
 		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
+	previousWeeklyActivation := store.Config().EnableWeeklyActivationProbe
 	state = normalizePluginDiskState(state)
 	if err := SaveUserData(semanticStatePaths(defaultStatePath()).UserData, state); err != nil {
 		return jsonManagementResponse(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 	store.ReplaceConfig(state.Config)
 	currentConfig.Store(state.Config)
+	if state.Config.EnableWeeklyActivationProbe != previousWeeklyActivation {
+		managementWeeklyActivationChanged(state.Config.EnableWeeklyActivationProbe)
+	}
 	store.SetAnnotations(AnnotationState{Accounts: state.Accounts, Groups: state.Groups})
 	store.RecordLog("info", "ui.config_imported", "页面导入插件配置", nil, now)
 	return jsonManagementResponse(http.StatusOK, map[string]bool{"ok": true})
@@ -593,6 +616,7 @@ func buildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount, life
 		status.ResetCreditsTotalEarnedCount = cloneIntPtr(account.Quota.ResetCreditsTotalEarnedCount)
 		status.ResetCredits = append([]ResetCredit(nil), account.Quota.ResetCredits...)
 		status.ResetProbes = statusResetProbes(account.ResetProbes)
+		status.WeeklyActivationProbe = statusWeeklyActivationProbe(account.Instance)
 		if !account.LastSuccessAt.IsZero() {
 			age := snapshot.Now.Sub(account.LastSuccessAt)
 			if age < 0 {
@@ -821,6 +845,31 @@ func statusResetProbes(probes map[WindowKind]ResetProbeState) []StatusResetProbe
 	return statuses
 }
 
+func statusWeeklyActivationProbe(instance AuthInstanceID) *StatusWeeklyActivationProbe {
+	if instance == 0 {
+		return nil
+	}
+	refresherMu.Lock()
+	refresher := globalRefresher
+	refresherMu.Unlock()
+	if refresher == nil {
+		return nil
+	}
+	state, ok := refresher.weeklyActivationState(instance)
+	if !ok {
+		return nil
+	}
+	return &StatusWeeklyActivationProbe{
+		State:         state.State,
+		WeeklyResetAt: formatTime(state.WeeklyResetAt),
+		CooldownUntil: formatTime(state.CooldownUntil),
+		NextCheckAt:   formatTime(state.NextCheckAt),
+		LastProbeAt:   formatTime(state.LastProbeAt),
+		Attempts:      state.Attempts,
+		LastError:     sanitizeResetProbeError(state.LastError),
+	}
+}
+
 func sanitizeResetProbeError(message string) string {
 	if message == "" {
 		return ""
@@ -922,6 +971,9 @@ func sanitizePublicStatusPayload(payload StatusPayload) StatusPayload {
 	payload.Settings.QuotaEndpoint = ""
 	for i := range payload.Accounts {
 		payload.Accounts[i].LastError = sanitizeResetProbeError(payload.Accounts[i].LastError)
+		if payload.Accounts[i].WeeklyActivationProbe != nil {
+			payload.Accounts[i].WeeklyActivationProbe.LastError = sanitizeResetProbeError(payload.Accounts[i].WeeklyActivationProbe.LastError)
+		}
 		for j := range payload.Accounts[i].ResetProbes {
 			payload.Accounts[i].ResetProbes[j].Error = sanitizeResetProbeError(payload.Accounts[i].ResetProbes[j].Error)
 		}
@@ -1239,6 +1291,7 @@ var statusTemplateV2 = template.Must(template.New("status-v2").Funcs(template.Fu
 <label class="toggle"><span data-i18n="settings.handleEnabled">启用调度接管</span><input id="handleEnabled" type="checkbox"></label>
 <label class="toggle"><span data-i18n="settings.usageFeedback">失败反馈标记额度耗尽</span><input id="usageFeedback" type="checkbox"></label>
 <div class="setting-with-help"><label class="toggle"><span data-i18n="settings.enableResetProbe">自动激活新的额度周期</span><input id="enableResetProbe" name="enable_reset_probe" type="checkbox"></label><p class="setting-help" data-i18n="settings.enableResetProbeHelp">当额度重置时间已经到达，但 OpenAI 尚未生成新的额度周期时，发送一次极小的 Codex 请求尝试激活新周期，然后重新读取额度确认结果。可能消耗少量额度。</p></div>
+<div class="setting-with-help"><label class="toggle"><span data-i18n="settings.enableWeeklyActivationProbe">周额度对齐时自动发送“你好”</span><input id="enableWeeklyActivationProbe" name="enable_weekly_activation_probe" type="checkbox"></label><p class="setting-help" data-i18n="settings.enableWeeklyActivationProbeHelp">仅当 5 小时额度剩余 100%，且周额度重置时间与当前时间加 7 天的误差不超过 2 分钟时发送一次“你好”。周时间不再对齐后会停止自动发送，需手动刷新账号额度重新确认。</p></div>
 <div class="setting-with-help"><label class="toggle"><span data-i18n="settings.provisionalProbe">账号列表未确认时仍允许额度探测（高风险）</span><input id="probeOnProvisionalRoster" name="probe_on_provisional_roster" type="checkbox"></label><p class="setting-help" data-i18n="settings.provisionalProbeHelp">CPA 暂时无法确认当前账号及优先级时，允许插件使用最近一次保存的账号列表执行额度重置探测。每次都会重新验证账号凭据，但仍无法保证账号未被删除或调整优先级。通常应保持关闭。</p></div>
 <label class="field"><span data-i18n="settings.monthlyMode">月度账号使用方式</span><select id="monthlyMode"><option value="expiry_order" data-i18n="settings.expiryOrder">按到期时间排序</option><option value="priority" data-i18n="settings.monthlyPriority">优先使用月度账号</option></select></label>
 <label class="field"><span data-i18n="settings.refreshInterval">额度刷新间隔</span><input id="refreshInterval" spellcheck="false"></label>
@@ -1265,6 +1318,7 @@ var statusTemplateV2 = template.Must(template.New("status-v2").Funcs(template.Fu
 <div class="badges">{{if and $.NextAuthID (eq $.NextAuthID .AuthID)}}<span class="badge next">下一优先</span>{{end}}{{if .Available}}<span class="badge ok">可用</span>{{else}}<span class="badge no">{{.UnavailableReason}}</span>{{end}}<span class="badge">{{if eq .Family "weekly"}}Weekly{{else if eq .Family "monthly"}}Monthly{{else}}未知类型{{end}}</span><span class="badge">CPA 优先级 {{.CPAPriority}}</span><span class="badge">插件优先级 {{.SchedulerPriority}}</span><span class="badge">熔断：{{.Circuit.Label}}</span></div>
 <div class="quotaList">{{if not .FiveHour.Missing}}<div class="quota-row"><div class="quota-head"><span class="quota-title">{{.FiveHour.Label}}</span><span>{{.FiveHour.DisplayText}}</span><span class="quota-reset">5 小时重置：<span class="localTime" data-time="{{.FiveHour.ResetText}}">{{.FiveHour.ResetText}}</span></span></div><div class="quota-bar"><div class="quota-fill {{if .FiveHour.Exhausted}}danger{{else if le .FiveHour.RemainingPercent 20.0}}warn{{end}}" style="width:{{printf "%.0f" .FiveHour.RemainingPercent}}%"></div></div></div>{{end}}<div class="quota-row"><div class="quota-head"><span class="quota-title">{{.LongWindow.Label}}</span><span>{{.LongWindow.DisplayText}}</span>{{if not .LongWindow.Missing}}<span class="quota-reset">长额度重置：<span class="localTime" data-time="{{.LongWindow.ResetText}}">{{.LongWindow.ResetText}}</span></span>{{end}}</div><div class="quota-bar"><div class="quota-fill {{if .LongWindow.Exhausted}}danger{{else if le .LongWindow.RemainingPercent 20.0}}warn{{end}}" style="width:{{printf "%.0f" .LongWindow.RemainingPercent}}%"></div></div></div></div>
 <div class="kv"><span>缓存时间</span><span>{{if .CacheAge}}{{.CacheAge}}{{else}}暂无{{end}}</span><span>熔断计数</span><span>失败 {{.Circuit.FailureCount}} / 成功 {{.Circuit.SuccessCount}}{{if .Circuit.NextProbeText}}，半开 <span class="localTime" data-time="{{.Circuit.NextProbeText}}">{{.Circuit.NextProbeText}}</span>{{end}}</span><span>主动重置</span><span>{{if .ResetCreditsAvailableCount}}{{.ResetCreditsAvailableCount}} 次{{else}}暂无{{end}}{{if .ResetCreditsTotalEarnedCount}} / 累计 {{.ResetCreditsTotalEarnedCount}} 次{{end}}{{range .ResetCredits}}；{{if .Status}}{{.Status}} {{end}}有效期 <span class="localTime" data-time="{{.ExpiresAt}}">{{.ExpiresAt}}</span>{{end}}</span></div>
+{{if .WeeklyActivationProbe}}<div class="noteBlock"><div>周额度自动激活：{{.WeeklyActivationProbe.State}}</div>{{if .WeeklyActivationProbe.WeeklyResetAt}}<div>目标周重置：<span class="localTime" data-time="{{.WeeklyActivationProbe.WeeklyResetAt}}">{{.WeeklyActivationProbe.WeeklyResetAt}}</span></div>{{end}}{{if .WeeklyActivationProbe.NextCheckAt}}<div>下次探测：<span class="localTime" data-time="{{.WeeklyActivationProbe.NextCheckAt}}">{{.WeeklyActivationProbe.NextCheckAt}}</span></div>{{end}}{{if .WeeklyActivationProbe.LastError}}<div>激活错误：{{.WeeklyActivationProbe.LastError}}</div>{{end}}</div>{{end}}
 {{if or .Notes .GroupNotes}}<div class="noteBlock">{{if .Notes}}<div>账号备注：{{.Notes}}</div>{{end}}{{if .GroupNotes}}<div>分组备注：{{.GroupNotes}}</div>{{end}}</div>{{end}}
 <div class="cardActions"><button type="button" class="ghost refreshOne" data-auth-id="{{.AuthID}}">刷新额度</button><button type="button" class="secondary openEdit" data-auth-id="{{.AuthID}}">编辑</button></div>
 </article>{{else}}<div class="empty">暂无账号数据。等待额度刷新后，这里会显示账号卡片。</div>{{end}}</section>
@@ -1280,7 +1334,7 @@ const TRANSLATIONS={
   en:{
     'app.title':'Codex Quota Scheduler','app.subtitle':'Optimized Fill First scheduling. Configuration, aliases, groups, tags, and notes are saved in the plugin state file.','app.language':'Language','connection.managementKey':'CPA management key','connection.backgroundHint':'Once the scheduler is enabled, it runs in the background. This page does not need to stay open.',
     'resetProbe.warningTitle':'Automatic reset probe is off by default','resetProbe.warningBody':'Only after you check the box will the scheduler send one tiny Codex request when a reset looks lazy, nudging the next quota window to start.',
-    'settings.title':'Scheduler Settings','settings.summary':'Default configuration is ready; normally no manual changes are needed.','settings.handleEnabled':'Enable scheduler takeover','settings.usageFeedback':'Mark quota exhausted from failure feedback','settings.enableResetProbe':'Enable automatic reset probe','settings.enableResetProbeHelp':'When the quota reset time has arrived but OpenAI has not yet generated a new quota cycle, send one tiny Codex request to try to activate it, then read the quota again to confirm the result. This may consume a small amount of quota.','settings.provisionalProbe':'Allow quota probes when the account roster is unconfirmed (high risk)','settings.provisionalProbeHelp':'When CPA temporarily cannot confirm the current accounts and priorities, allow the plugin to use the most recently saved account roster for quota reset probes. Account credentials are revalidated every time, but the plugin still cannot guarantee that accounts have not been removed or reprioritized. This should normally remain off.','settings.monthlyMode':'Monthly mode','settings.expiryOrder':'Sort by expiry time','settings.monthlyPriority':'Prefer Monthly','settings.refreshInterval':'Quota refresh interval','settings.staleAfter':'Stale cache threshold','settings.refreshActiveWindow':'Refresh active window','settings.refreshAfterResetDelay':'Refresh after reset delay','settings.refreshRetryDelays':'Refresh retry delays','settings.refreshOnStartup':'Refresh on startup','settings.maxConcurrency':'Max refresh concurrency','settings.circuitFailureThreshold':'Circuit failure threshold','settings.circuitOpenDuration':'Circuit open duration','settings.circuitHalfOpenSuccessThreshold':'Half-open recovery successes','settings.maxLogEntries':'Max log entries','settings.logRetention':'Log retention',
+    'settings.title':'Scheduler Settings','settings.summary':'Default configuration is ready; normally no manual changes are needed.','settings.handleEnabled':'Enable scheduler takeover','settings.usageFeedback':'Mark quota exhausted from failure feedback','settings.enableResetProbe':'Enable automatic reset probe','settings.enableResetProbeHelp':'When the quota reset time has arrived but OpenAI has not yet generated a new quota cycle, send one tiny Codex request to try to activate it, then read the quota again to confirm the result. This may consume a small amount of quota.','settings.enableWeeklyActivationProbe':'Send “你好” when the weekly quota is aligned','settings.enableWeeklyActivationProbeHelp':'Only send once when the five-hour quota has 100% remaining and the weekly reset is within two minutes of seven days from now. Automatic sending stops after the weekly time no longer aligns; manually refresh the account to re-arm it.','settings.provisionalProbe':'Allow quota probes when the account roster is unconfirmed (high risk)','settings.provisionalProbeHelp':'When CPA temporarily cannot confirm the current accounts and priorities, allow the plugin to use the most recently saved account roster for quota reset probes. Account credentials are revalidated every time, but the plugin still cannot guarantee that accounts have not been removed or reprioritized. This should normally remain off.','settings.monthlyMode':'Monthly mode','settings.expiryOrder':'Sort by expiry time','settings.monthlyPriority':'Prefer Monthly','settings.refreshInterval':'Quota refresh interval','settings.staleAfter':'Stale cache threshold','settings.refreshActiveWindow':'Refresh active window','settings.refreshAfterResetDelay':'Refresh after reset delay','settings.refreshRetryDelays':'Refresh retry delays','settings.refreshOnStartup':'Refresh on startup','settings.maxConcurrency':'Max refresh concurrency','settings.circuitFailureThreshold':'Circuit failure threshold','settings.circuitOpenDuration':'Circuit open duration','settings.circuitHalfOpenSuccessThreshold':'Half-open recovery successes','settings.maxLogEntries':'Max log entries','settings.logRetention':'Log retention',
     'actions.loadData':'Load Data','actions.saveSettings':'Save Settings','actions.refreshQuota':'Refresh Quota','actions.exportConfig':'Export Config','actions.importConfig':'Import Config','actions.refreshLogs':'Refresh Logs','actions.exportLogs':'Export Logs','actions.close':'Close','actions.saveAccount':'Save Account','actions.cancel':'Cancel',
     'queue.title':'Account Queue','queue.description':'Account cards are sorted by the current scheduler priority. The first available account is preferred for the next Codex request.','metrics.nextAccount':'Next account','metrics.lastSelected':'Last selected',
     'logs.title':'Scheduler Logs','logs.empty':'No logs yet. Send a request or refresh quota manually to show records here.',
@@ -1291,7 +1345,7 @@ const TRANSLATIONS={
   'zh-CN':{
     'app.title':'Codex 额度调度器','app.subtitle':'优化版 Fill First。配置、别名、分组、标签和备注由插件内部状态文件保存。','app.language':'界面语言','connection.managementKey':'CPA 管理密钥','connection.backgroundHint':'只要调度器启动了，它就会在后台自动运行，无需保持页面开启。',
     'resetProbe.warningTitle':'自动激活新的额度周期默认关闭','resetProbe.warningBody':'开启后，调度器会在额度重置时间已到但新周期尚未生成时，发送一次极小的 Codex 请求尝试激活新周期。',
-    'settings.title':'调度设置','settings.summary':'默认配置已经都设置好了，正常情况下不需要手动设置。','settings.handleEnabled':'启用调度接管','settings.usageFeedback':'失败反馈标记额度耗尽','settings.enableResetProbe':'自动激活新的额度周期','settings.enableResetProbeHelp':'当额度重置时间已经到达，但 OpenAI 尚未生成新的额度周期时，发送一次极小的 Codex 请求尝试激活新周期，然后重新读取额度确认结果。可能消耗少量额度。','settings.provisionalProbe':'账号列表未确认时仍允许额度探测（高风险）','settings.provisionalProbeHelp':'CPA 暂时无法确认当前账号及优先级时，允许插件使用最近一次保存的账号列表执行额度重置探测。每次都会重新验证账号凭据，但仍无法保证账号未被删除或调整优先级。通常应保持关闭。','settings.monthlyMode':'月度账号使用方式','settings.expiryOrder':'按到期时间排序','settings.monthlyPriority':'优先使用月度账号','settings.refreshInterval':'额度刷新间隔','settings.staleAfter':'缓存过期判定','settings.refreshActiveWindow':'活跃刷新窗口','settings.refreshAfterResetDelay':'重置后刷新延迟','settings.refreshRetryDelays':'刷新失败重试间隔','settings.refreshOnStartup':'启动时刷新额度','settings.maxConcurrency':'最大并发刷新','settings.circuitFailureThreshold':'熔断失败阈值','settings.circuitOpenDuration':'熔断等待时间','settings.circuitHalfOpenSuccessThreshold':'半开恢复成功次数','settings.maxLogEntries':'最大日志条数','settings.logRetention':'日志保留时间',
+    'settings.title':'调度设置','settings.summary':'默认配置已经都设置好了，正常情况下不需要手动设置。','settings.handleEnabled':'启用调度接管','settings.usageFeedback':'失败反馈标记额度耗尽','settings.enableResetProbe':'自动激活新的额度周期','settings.enableResetProbeHelp':'当额度重置时间已经到达，但 OpenAI 尚未生成新的额度周期时，发送一次极小的 Codex 请求尝试激活新周期，然后重新读取额度确认结果。可能消耗少量额度。','settings.enableWeeklyActivationProbe':'周额度对齐时自动发送“你好”','settings.enableWeeklyActivationProbeHelp':'仅当 5 小时额度剩余 100%，且周额度重置时间与当前时间加 7 天的误差不超过 2 分钟时发送一次“你好”。周时间不再对齐后会停止自动发送，需手动刷新账号额度重新确认。','settings.provisionalProbe':'账号列表未确认时仍允许额度探测（高风险）','settings.provisionalProbeHelp':'CPA 暂时无法确认当前账号及优先级时，允许插件使用最近一次保存的账号列表执行额度重置探测。每次都会重新验证账号凭据，但仍无法保证账号未被删除或调整优先级。通常应保持关闭。','settings.monthlyMode':'月度账号使用方式','settings.expiryOrder':'按到期时间排序','settings.monthlyPriority':'优先使用月度账号','settings.refreshInterval':'额度刷新间隔','settings.staleAfter':'缓存过期判定','settings.refreshActiveWindow':'活跃刷新窗口','settings.refreshAfterResetDelay':'重置后刷新延迟','settings.refreshRetryDelays':'刷新失败重试间隔','settings.refreshOnStartup':'启动时刷新额度','settings.maxConcurrency':'最大并发刷新','settings.circuitFailureThreshold':'熔断失败阈值','settings.circuitOpenDuration':'熔断等待时间','settings.circuitHalfOpenSuccessThreshold':'半开恢复成功次数','settings.maxLogEntries':'最大日志条数','settings.logRetention':'日志保留时间',
     'actions.loadData':'加载数据','actions.saveSettings':'保存设置','actions.refreshQuota':'刷新额度','actions.exportConfig':'导出配置','actions.importConfig':'导入配置','actions.refreshLogs':'刷新日志','actions.exportLogs':'导出日志','actions.close':'关闭','actions.saveAccount':'保存账号','actions.cancel':'取消',
     'queue.title':'账号队列','queue.description':'账号卡片按当前调度优先级排序。第一个可用账号就是下一次 Codex 请求会优先选择的账号。','metrics.nextAccount':'下一账号','metrics.lastSelected':'最近选择',
     'logs.title':'调度日志','logs.empty':'暂无日志。发起请求或手动刷新额度后，这里会显示记录。',
@@ -1358,12 +1412,12 @@ function settingsFocusedOrDirty(){const panel=document.getElementById('settingsP
 function updateResetProbeWarning(){const warning=document.getElementById('resetProbeWarning');if(warning)warning.hidden=!(statusLoaded&&STATUS.settings&&STATUS.settings.enable_reset_probe!==true)}
 function updateProtectedVisibility(){const loaded=statusLoaded;const show=(id,visible)=>{const item=document.getElementById(id);if(item)item.hidden=!visible};show('settingsPanel',loaded);show('protectedMain',loaded);show('refreshQuota',loaded);show('loadData',!loaded);updateResetProbeWarning()}
 function renderRosterLifecycle(){const warning=document.getElementById('rosterLifecycleWarning');const title=document.getElementById('rosterLifecycleTitle');const body=document.getElementById('rosterLifecycleBody');if(!warning||!title||!body)return;const roster=STATUS.roster||{};const messages=[roster.warning,roster.risk_warning].filter(Boolean);warning.hidden=messages.length===0;title.textContent=[roster.capability,roster.health].filter(Boolean).join(' / ')||'Roster lifecycle';body.textContent=messages.join(' ')}
-function applyStatus(data,options){STATUS=data;statusLoaded=true;rebuildDerivedState();const shouldFillSettings=(options&&options.fillSettings)||!settingsInitialized||!settingsFocusedOrDirty();if(shouldFillSettings){fillSettings();settingsInitialized=true}renderMetrics();renderRosterLifecycle();renderAccounts(STATUS.accounts||[]);renderLogs(STATUS.logs||[]);updateProtectedVisibility();applyLocale()}
+function applyStatus(data,options){STATUS=data;statusLoaded=true;rebuildDerivedState();const shouldFillSettings=(options&&options.fillSettings)||!settingsInitialized||!settingsFocusedOrDirty();if(shouldFillSettings){fillSettings();settingsInitialized=true}renderMetrics();renderRosterLifecycle();renderAccounts(STATUS.accounts||[]);decorateWeeklyActivationCards();renderLogs(STATUS.logs||[]);updateProtectedVisibility();applyLocale()}
 async function refreshStatus(options){const opts=options||{};const data=await requestManagement('/status',{query:{format:'json'}});applyStatus(data,opts)}
 function startStatusPolling(){if(statusPollID)return;statusPollID=window.setInterval(()=>refreshStatus({management:true}).catch(()=>{}),15000)}
 async function loadStatus(){try{await refreshStatus({management:true,fillSettings:true});showNotice(t('notice.statusLoaded'),false);startStatusPolling()}catch(error){showNotice(error.message||String(error),true)}}
 async function pollStatus(times,delayMs){for(let i=0;i<times;i++){await new Promise((resolve)=>window.setTimeout(resolve,delayMs));await refreshStatus()}}
-function collectSettingsPayload(){return{handle_enabled:document.getElementById('handleEnabled').checked,enable_usage_feedback:document.getElementById('usageFeedback').checked,enable_reset_probe:document.getElementById('enableResetProbe').checked,probe_on_provisional_roster:document.getElementById('probeOnProvisionalRoster').checked,monthly_mode:document.getElementById('monthlyMode').value,quota_refresh_interval:document.getElementById('refreshInterval').value.trim(),stale_after:document.getElementById('staleAfter').value.trim(),refresh_active_window:document.getElementById('refreshActiveWindow').value.trim(),refresh_after_reset_delay:document.getElementById('refreshAfterResetDelay').value.trim(),refresh_retry_delays:document.getElementById('refreshRetryDelays').value.trim(),refresh_on_startup:document.getElementById('refreshOnStartup').checked,max_refresh_concurrency:Number.parseInt(document.getElementById('maxConcurrency').value,10)||1,circuit_failure_threshold:Number.parseInt(document.getElementById('circuitFailureThreshold').value,10)||5,circuit_open_duration:document.getElementById('circuitOpenDuration').value.trim(),circuit_half_open_success_threshold:Number.parseInt(document.getElementById('circuitHalfOpenSuccessThreshold').value,10)||2,max_log_entries:Number.parseInt(document.getElementById('maxLogEntries').value,10)||200,log_retention:document.getElementById('logRetention').value.trim()}}
+function collectSettingsPayload(){return{handle_enabled:document.getElementById('handleEnabled').checked,enable_usage_feedback:document.getElementById('usageFeedback').checked,enable_reset_probe:document.getElementById('enableResetProbe').checked,enable_weekly_activation_probe:document.getElementById('enableWeeklyActivationProbe').checked,probe_on_provisional_roster:document.getElementById('probeOnProvisionalRoster').checked,monthly_mode:document.getElementById('monthlyMode').value,quota_refresh_interval:document.getElementById('refreshInterval').value.trim(),stale_after:document.getElementById('staleAfter').value.trim(),refresh_active_window:document.getElementById('refreshActiveWindow').value.trim(),refresh_after_reset_delay:document.getElementById('refreshAfterResetDelay').value.trim(),refresh_retry_delays:document.getElementById('refreshRetryDelays').value.trim(),refresh_on_startup:document.getElementById('refreshOnStartup').checked,max_refresh_concurrency:Number.parseInt(document.getElementById('maxConcurrency').value,10)||1,circuit_failure_threshold:Number.parseInt(document.getElementById('circuitFailureThreshold').value,10)||5,circuit_open_duration:document.getElementById('circuitOpenDuration').value.trim(),circuit_half_open_success_threshold:Number.parseInt(document.getElementById('circuitHalfOpenSuccessThreshold').value,10)||2,max_log_entries:Number.parseInt(document.getElementById('maxLogEntries').value,10)||200,log_retention:document.getElementById('logRetention').value.trim()}}
 function node(tag,className,text){const item=document.createElement(tag);if(className)item.className=className;if(text!==undefined)item.textContent=text;return item}
 function addKV(parent,key,value){parent.append(node('span','',key),node('span','',value||'暂无'))}
 function addBadge(text,className){return node('span','badge '+(className||''),text)}
@@ -1374,9 +1428,10 @@ function renderEmptyState(){const empty=STATUS.empty_state||{};const title=empty
 function renderAccounts(accounts){const queue=document.querySelector('section.queue');if(!queue)return;queue.replaceChildren();const items=Array.isArray(accounts)?accounts:[];if(items.length===0){queue.append(renderEmptyState());return}for(const account of items){const card=node('article','card '+(STATUS.next_auth_id&&STATUS.next_auth_id===account.auth_id?'next':''));card.dataset.authId=account.auth_id||'';const top=node('div','cardTop');const identity=node('div','identity');const titleLine=node('div','titleLine');titleLine.append(node('span','title',account.alias||account.auth_id||''));if(account.group)titleLine.append(node('span','groupPill',account.group));identity.append(titleLine);const sub=node('div','sub');const code=document.createElement('code');code.textContent=account.auth_id||'';sub.append(code);identity.append(sub);if(account.tags&&account.tags.length){const tags=node('div','metaLine');for(const tag of account.tags)tags.append(node('span','chip',tag));identity.append(tags)}top.append(identity,node('span','rank','#'+(account.rank||'')));card.append(top);const badges=node('div','badges');if(STATUS.next_auth_id&&STATUS.next_auth_id===account.auth_id)badges.append(addBadge('下一优先','next'));badges.append(account.available?addBadge('可用','ok'):addBadge(labelUnavailableReason(account.unavailable_reason),'no'));badges.append(addBadge(account.family||'未知类型'),addBadge('CPA 优先级 '+(account.cpa_priority||0)),addBadge('插件优先级 '+(account.scheduler_priority||0)),addBadge('熔断：'+((account.circuit&&account.circuit.label)||'')));if(account.auth_failure)badges.append(addBadge('请重新登录','no'));if(account.refresh_due_reason)badges.append(addBadge(labelDueReason(account.refresh_due_reason)));card.append(badges);const quotaList=node('div','quotaList');if(account.five_hour&&!account.five_hour.missing)quotaList.append(addQuota(account.five_hour,'5 小时额度'));if(account.long_window)quotaList.append(addQuota(account.long_window,account.long_window.label||'长额度'));card.append(quotaList);const kv=node('div','kv');addKV(kv,'缓存时间',account.cache_age||'暂无');addKV(kv,'熔断计数','失败 '+((account.circuit&&account.circuit.failure_count)||0)+' / 成功 '+((account.circuit&&account.circuit.success_count)||0));addKV(kv,'主动重置',resetCreditSummary(account));if(account.status_note)addKV(kv,'调度状态',account.status_note);if(account.last_error)addKV(kv,'最后错误',account.last_error);if(account.next_retry_text)addKV(kv,'下次重试',account.next_retry_text);card.append(kv);if(account.notes||account.group_notes){const notes=node('div','noteBlock');if(account.notes)notes.append(node('div','',account.notes));if(account.group_notes)notes.append(node('div','',account.group_notes));card.append(notes)}const actions=node('div','cardActions');const refresh=node('button','ghost refreshOne','刷新额度');refresh.type='button';refresh.addEventListener('click',()=>refreshOneQuota(account.auth_id||''));const edit=node('button','secondary openEdit','编辑');edit.type='button';edit.addEventListener('click',()=>openEdit(account.auth_id||''));actions.append(refresh,edit);card.append(actions);queue.append(card)}formatLocalTimes()}
 
 async function readJSON(resp){const text=await resp.text();if(!text)return{};try{return JSON.parse(text)}catch{return{error:text}}}
+function decorateWeeklyActivationCards(){const byID=new Map((STATUS.accounts||[]).map((account)=>[account.auth_id,account]));for(const card of document.querySelectorAll('.card[data-auth-id]')){const account=byID.get(card.dataset.authId||'');const probe=account&&account.weekly_activation_probe;if(!probe)continue;const block=node('div','noteBlock');const manual=probe.state==='manual_refresh_required';block.append(node('div','',currentLocale==='en'?(manual?'Weekly activation: manual refresh required':'Weekly activation: '+(probe.state||'idle')):('周额度自动激活：'+(manual?'需要手动刷新':(probe.state||'空闲')))));if(probe.next_check_at){const date=new Date(probe.next_check_at);block.append(node('div','',currentLocale==='en'?'Next check: '+(Number.isNaN(date.getTime())?probe.next_check_at:date.toLocaleString('en-US',{hour12:false})):'下次探测：'+(Number.isNaN(date.getTime())?probe.next_check_at:date.toLocaleString('zh-CN',{hour12:false}))));}if(probe.last_error)block.append(node('div','',currentLocale==='en'?'Error: '+probe.last_error:'错误：'+probe.last_error));card.append(block)}}
 function authHeaders(){const input=document.getElementById('managementKey');const key=(input&&input.value||'').trim();if(!key)throw new Error(t('error.managementKeyRequired'));const name='Author'+'ization';const scheme='Bea'+'rer ';const headers={};headers[name]=key.toLowerCase().startsWith(scheme.toLowerCase())?key:scheme+key;return headers}
 async function requestManagement(path,options){const opts=options||{};const headers=authHeaders();let url=MANAGEMENT_BASE+path;if(opts.query){const params=new URLSearchParams(opts.query);url+='?'+params.toString()}const init={method:opts.method||'GET',headers};if(Object.prototype.hasOwnProperty.call(opts,'body')){headers['Content-Type']=opts.contentType||'application/json';init.body=typeof opts.body==='string'?opts.body:JSON.stringify(opts.body)}const resp=await fetch(url,init);const data=await readJSON(resp);if(!resp.ok)throw new Error(data.error||data.message||t('error.requestFailed',{status:resp.status}));return data}
-function fillSettings(){const s=STATUS.settings||{};document.getElementById('handleEnabled').checked=s.handle_enabled!==false;document.getElementById('usageFeedback').checked=s.enable_usage_feedback!==false;document.getElementById('enableResetProbe').checked=s.enable_reset_probe===true;document.getElementById('probeOnProvisionalRoster').checked=s.probe_on_provisional_roster===true;document.getElementById('monthlyMode').value=s.monthly_mode||'expiry_order';document.getElementById('refreshInterval').value=s.quota_refresh_interval||'30m0s';document.getElementById('staleAfter').value=s.stale_after||'5h0m0s';document.getElementById('refreshActiveWindow').value=s.refresh_active_window||'1h0m0s';document.getElementById('refreshAfterResetDelay').value=s.refresh_after_reset_delay||'1m0s';document.getElementById('refreshRetryDelays').value=s.refresh_retry_delays||'1m0s,5m0s,15m0s';document.getElementById('refreshOnStartup').checked=s.refresh_on_startup===true;document.getElementById('maxConcurrency').value=s.max_refresh_concurrency||1;document.getElementById('circuitFailureThreshold').value=s.circuit_failure_threshold||5;document.getElementById('circuitOpenDuration').value=s.circuit_open_duration||'30m0s';document.getElementById('circuitHalfOpenSuccessThreshold').value=s.circuit_half_open_success_threshold||2;document.getElementById('maxLogEntries').value=s.max_log_entries||200;document.getElementById('logRetention').value=s.log_retention||'24h0m0s'}
+function fillSettings(){const s=STATUS.settings||{};document.getElementById('handleEnabled').checked=s.handle_enabled!==false;document.getElementById('usageFeedback').checked=s.enable_usage_feedback!==false;document.getElementById('enableResetProbe').checked=s.enable_reset_probe===true;document.getElementById('enableWeeklyActivationProbe').checked=s.enable_weekly_activation_probe===true;document.getElementById('probeOnProvisionalRoster').checked=s.probe_on_provisional_roster===true;document.getElementById('monthlyMode').value=s.monthly_mode||'expiry_order';document.getElementById('refreshInterval').value=s.quota_refresh_interval||'30m0s';document.getElementById('staleAfter').value=s.stale_after||'5h0m0s';document.getElementById('refreshActiveWindow').value=s.refresh_active_window||'1h0m0s';document.getElementById('refreshAfterResetDelay').value=s.refresh_after_reset_delay||'1m0s';document.getElementById('refreshRetryDelays').value=s.refresh_retry_delays||'1m0s,5m0s,15m0s';document.getElementById('refreshOnStartup').checked=s.refresh_on_startup===true;document.getElementById('maxConcurrency').value=s.max_refresh_concurrency||1;document.getElementById('circuitFailureThreshold').value=s.circuit_failure_threshold||5;document.getElementById('circuitOpenDuration').value=s.circuit_open_duration||'30m0s';document.getElementById('circuitHalfOpenSuccessThreshold').value=s.circuit_half_open_success_threshold||2;document.getElementById('maxLogEntries').value=s.max_log_entries||200;document.getElementById('logRetention').value=s.log_retention||'24h0m0s'}
 async function saveSettings(){try{if(!statusLoaded){await loadStatus();return}await requestManagement('/settings',{method:'PUT',body:collectSettingsPayload()});settingsDirty=false;showNotice(t('notice.settingsSaved'),false);await refreshStatus({management:true,fillSettings:true})}catch(error){showNotice(error.message||String(error),true)}}
 async function refreshQuota(){try{await requestManagement('/refresh',{method:'POST'});showNotice(t('notice.refreshRequested'),false);await refreshStatus({management:true});pollStatus(3,1200)}catch(error){showNotice(error.message||String(error),true)}}
 function splitTags(text){return text.split(',').map((item)=>item.trim()).filter(Boolean)}

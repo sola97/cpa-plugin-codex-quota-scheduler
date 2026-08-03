@@ -50,7 +50,7 @@ func (w *ProbeWAL) ExecuteSend(send func() error) error { //kpoint:K_PROBE_BEFOR
 	} //kpoint:K_PROBE_AFTER_HTTP
 	return w.hit("K_PROBE_AFTER_HTTP")
 }
-func (w *ProbeWAL) PersistSent(i AuthInstanceID, at time.Time) error {
+func (w *ProbeWAL) PersistSent(i AuthInstanceID, at time.Time, usageEvidence ...bool) error {
 	//kpoint:K_PROBE_SENT_WRITE
 	if err := w.hit("K_PROBE_SENT_WRITE"); err != nil {
 		return err
@@ -59,6 +59,9 @@ func (w *ProbeWAL) PersistSent(i AuthInstanceID, at time.Time) error {
 		a := s.ProbeAttempts[i]
 		a.Phase = ProbeAttemptSent
 		a.SentAt = &at
+		if len(usageEvidence) > 0 {
+			a.UsageEvidence = usageEvidence[0]
+		}
 		s.ProbeAttempts[i] = a
 		return nil
 	})

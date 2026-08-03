@@ -40,6 +40,10 @@ using fallback. Plugin priority never reads from or writes to CPA.
   quota exhaustion as a circuit-breaker failure.
 - Five-hour, weekly, monthly, and reset-credit quota display when available.
 - Circuit breaker state for repeated account failures.
+- Optional weekly-aligned activation probe that sends one `你好` request when
+  the five-hour quota is 100% remaining and the weekly reset is about seven
+  days away. It is disabled by default and stops until a manual refresh after
+  the weekly timestamp no longer aligns.
 - Bilingual Management UI: English and Chinese, with browser-language detection
   and a manual language selector.
 - Account aliases, notes, tags, and groups stored in the plugin's local state.
@@ -62,11 +66,17 @@ endpoints:
 ```text
 GET https://chatgpt.com/backend-api/wham/usage
 GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits
+POST https://chatgpt.com/backend-api/codex/responses/compact
 ```
 
 Those requests use the Codex credentials already configured in CPA. The plugin
 uses the responses to calculate account quota state, reset-credit availability,
 and scheduling order.
+
+The compact `POST` is only used when `enable_weekly_activation_probe` is
+explicitly enabled and an account passes the weekly-alignment rule described
+above. Its request text is `你好`; the feature records a durable per-account,
+per-weekly-reset result so the same weekly cycle is not probed twice.
 
 The plugin stores local state in CPA's plugin state area. Stored data can
 include scheduler settings, recent quota snapshots, logs, aliases, notes, tags,
@@ -131,6 +141,8 @@ refresh_on_startup: false
 monthly_mode: expiry_order
 fallback: fill-first
 enable_usage_feedback: true
+enable_reset_probe: false
+enable_weekly_activation_probe: false
 max_refresh_concurrency: 1
 quota_endpoint: https://chatgpt.com/backend-api/wham/usage
 circuit_failure_threshold: 5

@@ -199,6 +199,21 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 			refresher.Start()
 		}
 	}
+	managementWeeklyActivationChanged = func(enabled bool) {
+		refresherMu.Lock()
+		refresher := globalRefresher
+		refresherMu.Unlock()
+		if refresher == nil {
+			return
+		}
+		if enabled {
+			_ = refresher.bootstrapWeeklyActivationStates()
+		}
+		refresher.wakeRefreshLoop()
+		if enabled {
+			refresher.Start()
+		}
+	}
 	managementRefreshSoon = refreshGlobalRefresherSoon
 	managementRefreshOneSoon = refreshGlobalRefresherOneSoon
 	refresherMu.Unlock()

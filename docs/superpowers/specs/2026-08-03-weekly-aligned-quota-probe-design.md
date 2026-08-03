@@ -1,6 +1,6 @@
 # Weekly-Aligned Primary Quota Activation Probe Design
 
-Status: Design review
+Status: Implemented
 
 Date: 2026-08-03
 

@@ -767,6 +767,7 @@ func (r *QuotaRefresher) CancelRosterInstances(authIDs []string) error {
 		for _, instance := range instances {
 			delete(s.ProbeWindows, instance)
 			delete(s.ProbeAttempts, instance)
+			delete(s.WeeklyActivationProbes, instance)
 		}
 		return nil
 	})
@@ -820,6 +821,10 @@ func NewQuotaRefresher(host HostClient, state *PluginState, now func() time.Time
 						applyErr = err
 						return
 					}
+					if err := r.syncWeeklyActivationState(intent.Instance, account.Quota, intent.Source == SourceManualRefresh); err != nil {
+						applyErr = err
+						return
+					}
 				}
 				r.state.applyLegacyEffectJournal(*result.Journal)
 			}
@@ -834,6 +839,9 @@ func NewQuotaRefresher(host HostClient, state *PluginState, now func() time.Time
 			}
 			if err := r.bootstrapProbeWindows(); err != nil {
 				r.state.RecordLog("warn", "probe.bootstrap_failed", "Probe 状态初始化失败，将在下次刷新重试", map[string]any{"auth_id": intent.AuthID, "error": redactSecrets(err.Error())}, r.now())
+			}
+			if err := r.bootstrapWeeklyActivationStates(); err != nil {
+				r.state.RecordLog("warn", "probe.weekly_activation_bootstrap_failed", "周额度激活状态初始化失败，将在下次刷新重试", map[string]any{"auth_id": intent.AuthID, "error": redactSecrets(err.Error())}, r.now())
 			}
 			return nil
 		},
@@ -1263,6 +1271,9 @@ func (r *QuotaRefresher) nextRefreshLoopDelay() (time.Duration, bool) {
 	}
 	if legacy := r.state.NextRefreshDueAt(now); !legacy.IsZero() && (deadline.IsZero() || legacy.Before(deadline)) {
 		deadline = legacy
+	}
+	if weekly := r.weeklyActivationNextDeadline(); !weekly.IsZero() && (deadline.IsZero() || weekly.Before(deadline)) {
+		deadline = weekly
 	}
 	if deadline.IsZero() {
 		return 0, false
