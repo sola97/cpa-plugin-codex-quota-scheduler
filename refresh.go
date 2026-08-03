@@ -808,6 +808,19 @@ func NewQuotaRefresher(host HostClient, state *PluginState, now func() time.Time
 			return ValidateWriteback(BindingVersion{Instance: b.Instance, Admission: b.Admission, Tier: TierGeneration(b.Generation), Login: b.Login, Fingerprint: b.Fingerprint}, WritebackVersion{Token: result.Token, Login: result.Login, Fingerprint: result.Fingerprint})
 		},
 		Apply: func(intent Intent, result OperationResult) error {
+			if effect, ok := result.Value.(weeklyActivationEffect); ok {
+				var applyErr error
+				apply := func() {
+					applyErr = r.applyWeeklyActivationEffect(intent.AuthID, effect)
+				}
+				if r.bindings != nil && !r.bindings.ApplyIfCurrent(intent.AuthID, WritebackVersion{Token: result.Token, Login: result.Login, Fingerprint: result.Fingerprint}, apply) {
+					return ErrStaleExecutionToken
+				}
+				if r.bindings == nil {
+					apply()
+				}
+				return applyErr
+			}
 			if result.Journal == nil {
 				return nil
 			}
@@ -1198,7 +1211,7 @@ func (r *QuotaRefresher) Start() {
 	r.stopping = false
 	r.mu.Unlock()
 	if r.probeController != nil {
-		r.launchProbe(true)
+		r.launchProbe()
 	}
 
 	go func() {
@@ -1222,7 +1235,7 @@ func (r *QuotaRefresher) Start() {
 				r.refreshController.OnDeadline(r.now())
 				r.RefreshDueSoon()
 				if r.probeController != nil {
-					r.launchProbe(false)
+					r.launchProbe()
 				}
 			case <-wake:
 				if timer != nil && !timer.Stop() {
@@ -1244,7 +1257,7 @@ func (r *QuotaRefresher) Start() {
 	}()
 }
 
-func (r *QuotaRefresher) launchProbe(recoverFirst bool) {
+func (r *QuotaRefresher) launchProbe() {
 	r.mu.Lock()
 	if r.stopping {
 		r.mu.Unlock()
@@ -1254,9 +1267,7 @@ func (r *QuotaRefresher) launchProbe(recoverFirst bool) {
 	r.mu.Unlock()
 	go func() {
 		defer r.wg.Done()
-		if recoverFirst {
-			_ = r.RunProbeRecoveryOnce(context.Background())
-		}
+		_ = r.RunProbeRecoveryOnce(context.Background())
 		_ = r.RunProbeDueOnce(context.Background())
 	}()
 }

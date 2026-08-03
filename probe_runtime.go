@@ -841,123 +841,96 @@ func (r *QuotaRefresher) readProbeQuota(ctx context.Context, held *HeldLease, bi
 	return probeReadResult{Quota: quota, Credentials: credentials}, err
 }
 
-func (r *QuotaRefresher) runWeeklyActivationSequence(ctx context.Context, intent Intent, held *HeldLease, p probeSequencePayload) OperationResult {
-	res := OperationResult{Token: intent.Token, Login: intent.Login, Fingerprint: intent.Fingerprint}
-	attempt := p.Attempt
-	fail := func(err error, sent bool) OperationResult {
-		if r.runtimeRoster().Provisional && (errors.Is(err, ErrProvisionalFingerprintMismatch) || errors.Is(err, ErrCapabilityB)) {
-			r.clearProvisionalPermit()
-			r.rosterMu.Lock()
-			if r.roster.Provisional {
-				r.roster.BackgroundAllowed = false
-				r.roster.Health = RosterWaiting
-			}
-			r.rosterMu.Unlock()
-			_ = r.persistProbeRosterHold()
-			return OperationResult{Token: intent.Token, Err: err}
+func weeklyActivationEffectResult(intent Intent, effect weeklyActivationEffect, readStartSeq uint64, err error) OperationResult {
+	return OperationResult{Token: intent.Token, Login: intent.Login, Fingerprint: intent.Fingerprint, Value: effect, ReadStartSeq: readStartSeq, Err: err}
+}
+
+func (r *QuotaRefresher) weeklyActivationFailureResult(intent Intent, attempt ProbeAttempt, err error, sent bool, quota *ParsedQuota) OperationResult {
+	if r.runtimeRoster().Provisional && (errors.Is(err, ErrProvisionalFingerprintMismatch) || errors.Is(err, ErrCapabilityB)) {
+		r.clearProvisionalPermit()
+		r.rosterMu.Lock()
+		if r.roster.Provisional {
+			r.roster.BackgroundAllowed = false
+			r.roster.Health = RosterWaiting
 		}
-		if status, ok := err.(quotaStatusError); ok && status.status == http.StatusUnauthorized && r.bindings != nil {
-			_ = r.bindings.MarkAuthBlocked(intent.AuthID)
-		}
-		failureErr := err
-		if sent {
-			until := attempt.SuppressUntil
-			if until.IsZero() {
-				until = r.now().Add(weeklyActivationCooldownTime)
-			}
-			if stateErr := r.markWeeklyActivationCooldown(intent.Instance, until, err); stateErr != nil {
-				failureErr = errors.Join(failureErr, stateErr)
-			}
-			if r.probeWAL != nil {
-				if walErr := r.probeWAL.PersistSentUnknown(intent.Instance, until); walErr != nil {
-					failureErr = errors.Join(failureErr, walErr)
-				}
-			}
-		} else {
-			if stateErr := r.markWeeklyActivationRetry(intent.Instance, err); stateErr != nil {
-				failureErr = errors.Join(failureErr, stateErr)
-			}
-			if r.probeWAL != nil {
-				if walErr := r.probeWAL.Complete(intent.Instance); walErr != nil {
-					failureErr = errors.Join(failureErr, walErr)
-				}
-			}
-		}
-		return OperationResult{Token: intent.Token, Err: failureErr}
+		r.rosterMu.Unlock()
+		_ = r.persistProbeRosterHold()
+		return OperationResult{Token: intent.Token, Err: err}
 	}
-	complete := func() error {
-		if r.probeWAL == nil {
-			return nil
-		}
-		return r.probeWAL.Complete(intent.Instance)
+	if status, ok := err.(quotaStatusError); ok && status.status == http.StatusUnauthorized && r.bindings != nil {
+		_ = r.bindings.MarkAuthBlocked(intent.AuthID)
+	}
+	effect := weeklyActivationEffect{Instance: intent.Instance, AttemptID: attempt.AttemptID, Quota: quota, Err: err}
+	if !sent {
+		effect.Outcome = weeklyActivationEffectRetry
+		effect.CompleteAttempt = true
+		return weeklyActivationEffectResult(intent, effect, 0, err)
 	}
 
+	until := attempt.SuppressUntil
+	if until.IsZero() {
+		until = r.now().Add(weeklyActivationCooldownTime)
+	}
+	nextVerify := r.now().Add(probeBackoff(1))
+	if attempt.VerifyNotBefore.After(nextVerify) {
+		nextVerify = attempt.VerifyNotBefore
+	}
+	if r.probeWAL != nil {
+		if walErr := r.probeWAL.PersistSentUnknown(intent.Instance, until, nextVerify); walErr != nil {
+			err = errors.Join(err, walErr)
+			effect.Err = err
+		}
+	}
+	effect.Outcome = weeklyActivationEffectCooldown
+	effect.CooldownUntil = until
+	return weeklyActivationEffectResult(intent, effect, 0, err)
+}
+
+func (r *QuotaRefresher) runWeeklyActivationSequence(ctx context.Context, intent Intent, held *HeldLease, p probeSequencePayload) OperationResult {
+	attempt := p.Attempt
 	if p.Recovery {
 		if attempt.SendFenceSeq == 0 {
 			attempt.SendFenceSeq = intent.StartedAfter
 		}
 		if attempt.SendFenceSeq == 0 {
-			return fail(errors.New("weekly activation recovery missing send fence"), true)
+			return r.weeklyActivationFailureResult(intent, attempt, errors.New("weekly activation recovery missing send fence"), true, nil)
 		}
 		seq, err := r.probeFence.Next()
 		if err != nil {
-			return fail(err, true)
+			return r.weeklyActivationFailureResult(intent, attempt, err, true, nil)
 		}
 		if seq <= attempt.SendFenceSeq {
-			return fail(errors.New("weekly activation verify read did not start after send fence"), true)
+			return r.weeklyActivationFailureResult(intent, attempt, errors.New("weekly activation verify read did not start after send fence"), true, nil)
 		}
 		verified, err := r.readProbeQuota(ctx, held, p.Binding)
 		if err != nil {
-			return fail(err, true)
+			return r.weeklyActivationFailureResult(intent, attempt, err, true, nil)
 		}
 		resetAt, aligned := weeklyActivationResetAt(verified.Quota)
 		if !aligned || !weeklyResetAligned(resetAt, r.now()) {
-			if err = r.markWeeklyActivationManual(intent.Instance, resetAt, nil); err != nil {
-				return fail(err, true)
-			}
-			if err = complete(); err != nil {
-				return fail(err, true)
-			}
-			res.ReadStartSeq, res.Value = seq, verified
-			return res
+			effect := weeklyActivationEffect{Instance: intent.Instance, AttemptID: attempt.AttemptID, Outcome: weeklyActivationEffectManual, Quota: &verified.Quota, ResetAt: resetAt, CompleteAttempt: true}
+			return weeklyActivationEffectResult(intent, effect, seq, nil)
 		}
 		if !attempt.UsageEvidence && !weeklyActivationPostSendEvidence(verified.Quota) {
 			verificationErr := errors.New("weekly activation verification did not produce positive usage evidence")
-			if err = r.markWeeklyActivationRetry(intent.Instance, verificationErr); err != nil {
-				return fail(err, true)
-			}
-			if err = complete(); err != nil {
-				return fail(err, true)
-			}
-			return OperationResult{Token: intent.Token, Err: verificationErr, Value: verified, ReadStartSeq: seq}
+			effect := weeklyActivationEffect{Instance: intent.Instance, AttemptID: attempt.AttemptID, Outcome: weeklyActivationEffectRetry, Quota: &verified.Quota, RetryNotBefore: attempt.SuppressUntil, Err: verificationErr, CompleteAttempt: true}
+			return weeklyActivationEffectResult(intent, effect, seq, verificationErr)
 		}
-		if err = r.markWeeklyActivationConfirmed(intent.Instance, resetAt, probeAttemptSentAtOrNow(attempt, r.now())); err != nil {
-			return fail(err, true)
-		}
-		if err = complete(); err != nil {
-			return fail(err, true)
-		}
-		res.ReadStartSeq, res.Value = seq, verified
-		return res
+		effect := weeklyActivationEffect{Instance: intent.Instance, AttemptID: attempt.AttemptID, Outcome: weeklyActivationEffectConfirmed, Quota: &verified.Quota, ResetAt: resetAt, ProbeAt: probeAttemptSentAtOrNow(attempt, r.now()), CompleteAttempt: true}
+		return weeklyActivationEffectResult(intent, effect, seq, nil)
 	}
 
 	pre, err := r.readProbeQuota(ctx, held, p.Binding)
 	if err != nil {
-		return fail(err, false)
+		return r.weeklyActivationFailureResult(intent, attempt, err, false, nil)
 	}
 	if !weeklyActivationEligible(pre.Quota, r.now()) {
-		if err = r.syncWeeklyActivationState(intent.Instance, pre.Quota, false); err != nil {
-			return fail(err, false)
-		}
-		if err = complete(); err != nil {
-			return fail(err, false)
-		}
-		res.Value = pre
-		return res
+		effect := weeklyActivationEffect{Instance: intent.Instance, AttemptID: attempt.AttemptID, Outcome: weeklyActivationEffectSync, Quota: &pre.Quota, CompleteAttempt: true}
+		return weeklyActivationEffectResult(intent, effect, 0, nil)
 	}
 	fence, err := r.probeFence.Next()
 	if err != nil {
-		return fail(err, false)
+		return r.weeklyActivationFailureResult(intent, attempt, err, false, &pre.Quota)
 	}
 	attempt.Purpose = ProbePurposeWeeklyActivation
 	attempt.SendFenceSeq = fence
@@ -966,7 +939,7 @@ func (r *QuotaRefresher) runWeeklyActivationSequence(ctx context.Context, intent
 	attempt.SuppressUntil = attempt.CreatedAt.Add(weeklyActivationCooldownTime)
 	attempt.UsageEvidence = false
 	if err = r.probeWAL.PersistSending(attempt); err != nil {
-		return fail(err, false)
+		return r.weeklyActivationFailureResult(intent, attempt, err, false, &pre.Quota)
 	}
 	held.MarkProbeSent(attempt.SuppressUntil)
 	usageEvidence := false
@@ -993,54 +966,37 @@ func (r *QuotaRefresher) runWeeklyActivationSequence(ctx context.Context, intent
 		})
 	})
 	if err != nil {
-		return fail(err, true)
+		return r.weeklyActivationFailureResult(intent, attempt, err, true, &pre.Quota)
 	}
 	if err = r.probeWAL.PersistSent(intent.Instance, r.now(), usageEvidence); err != nil {
-		return fail(err, true)
+		return r.weeklyActivationFailureResult(intent, attempt, err, true, &pre.Quota)
 	}
 	if err = held.WaitPropagation(ctx, 3*time.Second); err != nil {
-		return fail(err, true)
+		return r.weeklyActivationFailureResult(intent, attempt, err, true, &pre.Quota)
 	}
 	seq, err := r.probeFence.Next()
 	if err != nil {
-		return fail(err, true)
+		return r.weeklyActivationFailureResult(intent, attempt, err, true, &pre.Quota)
 	}
 	if seq <= fence {
-		return fail(errors.New("weekly activation verify read did not start after send fence"), true)
+		return r.weeklyActivationFailureResult(intent, attempt, errors.New("weekly activation verify read did not start after send fence"), true, &pre.Quota)
 	}
 	verified, err := r.readProbeQuota(ctx, held, p.Binding)
 	if err != nil {
-		return fail(err, true)
+		return r.weeklyActivationFailureResult(intent, attempt, err, true, &pre.Quota)
 	}
 	resetAt, aligned := weeklyActivationResetAt(verified.Quota)
 	if !aligned || !weeklyResetAligned(resetAt, r.now()) {
-		if err = r.markWeeklyActivationManual(intent.Instance, resetAt, nil); err != nil {
-			return fail(err, true)
-		}
-		if err = complete(); err != nil {
-			return fail(err, true)
-		}
-		res.ReadStartSeq, res.Value = seq, verified
-		return res
+		effect := weeklyActivationEffect{Instance: intent.Instance, AttemptID: attempt.AttemptID, Outcome: weeklyActivationEffectManual, Quota: &verified.Quota, ResetAt: resetAt, CompleteAttempt: true}
+		return weeklyActivationEffectResult(intent, effect, seq, nil)
 	}
 	if !usageEvidence && !weeklyActivationPostSendEvidence(verified.Quota) {
 		verificationErr := errors.New("weekly activation response did not produce positive usage evidence")
-		if err = r.markWeeklyActivationRetry(intent.Instance, verificationErr); err != nil {
-			return fail(err, true)
-		}
-		if err = complete(); err != nil {
-			return fail(err, true)
-		}
-		return OperationResult{Token: intent.Token, Err: verificationErr, Value: verified, ReadStartSeq: seq}
+		effect := weeklyActivationEffect{Instance: intent.Instance, AttemptID: attempt.AttemptID, Outcome: weeklyActivationEffectRetry, Quota: &verified.Quota, RetryNotBefore: attempt.SuppressUntil, Err: verificationErr, CompleteAttempt: true}
+		return weeklyActivationEffectResult(intent, effect, seq, verificationErr)
 	}
-	if err = r.markWeeklyActivationConfirmed(intent.Instance, resetAt, r.now()); err != nil {
-		return fail(err, true)
-	}
-	if err = complete(); err != nil {
-		return fail(err, true)
-	}
-	res.ReadStartSeq, res.Value = seq, verified
-	return res
+	effect := weeklyActivationEffect{Instance: intent.Instance, AttemptID: attempt.AttemptID, Outcome: weeklyActivationEffectConfirmed, Quota: &verified.Quota, ResetAt: resetAt, ProbeAt: r.now(), CompleteAttempt: true}
+	return weeklyActivationEffectResult(intent, effect, seq, nil)
 }
 
 func probeAttemptSentAtOrNow(a ProbeAttempt, now time.Time) time.Time {

@@ -28,6 +28,32 @@ type WeeklyActivationProbeState struct {
 	LastError     string                `json:"last_error,omitempty"`
 }
 
+type weeklyActivationEffectOutcome string
+
+const (
+	weeklyActivationEffectSync      weeklyActivationEffectOutcome = "sync"
+	weeklyActivationEffectRetry     weeklyActivationEffectOutcome = "retry"
+	weeklyActivationEffectCooldown  weeklyActivationEffectOutcome = "cooldown"
+	weeklyActivationEffectManual    weeklyActivationEffectOutcome = "manual"
+	weeklyActivationEffectConfirmed weeklyActivationEffectOutcome = "confirmed"
+)
+
+// weeklyActivationEffect carries facts observed by a held sequence. Its
+// state transition is applied only after the Coordinator validates the
+// binding token, so an obsolete sequence cannot replace current state.
+type weeklyActivationEffect struct {
+	Instance        AuthInstanceID
+	AttemptID       string
+	Outcome         weeklyActivationEffectOutcome
+	Quota           *ParsedQuota
+	ResetAt         time.Time
+	ProbeAt         time.Time
+	RetryNotBefore  time.Time
+	CooldownUntil   time.Time
+	Err             error
+	CompleteAttempt bool
+}
+
 func weeklyActivationPrimaryReady(quota ParsedQuota) bool {
 	return quota.FiveHour != nil && quota.FiveHour.UsedPercent != nil && *quota.FiveHour.UsedPercent == 0
 }
@@ -185,7 +211,7 @@ func (r *QuotaRefresher) weeklyActivationNextDeadline() time.Time {
 		}
 	}
 	for _, state := range persisted.WeeklyActivationProbes {
-		if !weeklyActivationStateDue(state, now) {
+		if state.State != WeeklyActivationReady && state.State != WeeklyActivationRetryWait {
 			continue
 		}
 		deadline := state.NextCheckAt
@@ -195,12 +221,110 @@ func (r *QuotaRefresher) weeklyActivationNextDeadline() time.Time {
 		consider(deadline)
 	}
 	for _, attempt := range persisted.ProbeAttempts {
-		if attempt.Purpose != ProbePurposeWeeklyActivation || !nonterminalProbeAttempt(attempt) {
+		if attempt.Purpose != ProbePurposeWeeklyActivation {
 			continue
 		}
-		consider(attempt.VerifyNotBefore)
+		switch attempt.Phase {
+		case ProbeAttemptPrepared:
+			consider(now)
+		case ProbeAttemptSending, ProbeAttemptSent, ProbeAttemptSentUnknown:
+			deadline := attempt.VerifyNotBefore
+			if deadline.IsZero() {
+				deadline = now
+			}
+			consider(deadline)
+		}
 	}
 	return next
+}
+
+func weeklyActivationRetryDeadline(now time.Time, attempts int, notBefore time.Time) time.Time {
+	next := now.Add(probeBackoff(attempts))
+	if notBefore.After(next) {
+		return notBefore
+	}
+	return next
+}
+
+func setWeeklyActivationError(state *WeeklyActivationProbeState, err error) {
+	if err != nil {
+		state.LastError = sanitizeResetProbeError(redactSecrets(err.Error()))
+	}
+}
+
+func (r *QuotaRefresher) applyWeeklyActivationEffect(authID string, effect weeklyActivationEffect) error {
+	if r == nil || r.runtimeStore == nil || r.state == nil || effect.Instance == 0 {
+		return nil
+	}
+	now := r.now()
+	applied := false
+	_, err := r.runtimeStore.Update(func(persisted *PersistentState) error {
+		attempt, exists := persisted.ProbeAttempts[effect.Instance]
+		if effect.AttemptID != "" && (!exists || attempt.AttemptID != effect.AttemptID) {
+			return nil
+		}
+		state := persisted.WeeklyActivationProbes[effect.Instance]
+		switch effect.Outcome {
+		case weeklyActivationEffectSync:
+			if effect.Quota == nil {
+				return nil
+			}
+			next, keep := deriveWeeklyActivationState(state, true, *effect.Quota, now, false)
+			if keep {
+				persisted.WeeklyActivationProbes[effect.Instance] = next
+			} else {
+				delete(persisted.WeeklyActivationProbes, effect.Instance)
+			}
+		case weeklyActivationEffectRetry:
+			if state.State != WeeklyActivationManualRefreshRequired && state.State != WeeklyActivationConfirmed {
+				state.State = WeeklyActivationRetryWait
+				state.Attempts++
+				state.NextCheckAt = weeklyActivationRetryDeadline(now, state.Attempts, effect.RetryNotBefore)
+				state.CooldownUntil = time.Time{}
+				setWeeklyActivationError(&state, effect.Err)
+				persisted.WeeklyActivationProbes[effect.Instance] = state
+			}
+		case weeklyActivationEffectCooldown:
+			if state.State != WeeklyActivationManualRefreshRequired && state.State != WeeklyActivationConfirmed {
+				state.State = WeeklyActivationCooldown
+				state.Attempts++
+				state.CooldownUntil = effect.CooldownUntil
+				state.NextCheckAt = time.Time{}
+				setWeeklyActivationError(&state, effect.Err)
+				persisted.WeeklyActivationProbes[effect.Instance] = state
+			}
+		case weeklyActivationEffectManual:
+			state.State = WeeklyActivationManualRefreshRequired
+			state.WeeklyResetAt = effect.ResetAt
+			state.NextCheckAt = time.Time{}
+			state.CooldownUntil = time.Time{}
+			setWeeklyActivationError(&state, effect.Err)
+			persisted.WeeklyActivationProbes[effect.Instance] = state
+		case weeklyActivationEffectConfirmed:
+			state.State = WeeklyActivationConfirmed
+			state.WeeklyResetAt = effect.ResetAt
+			state.CooldownUntil = time.Time{}
+			state.NextCheckAt = time.Time{}
+			state.LastProbeAt = effect.ProbeAt
+			state.LastError = ""
+			persisted.WeeklyActivationProbes[effect.Instance] = state
+		default:
+			return nil
+		}
+		if effect.CompleteAttempt {
+			delete(persisted.ProbeAttempts, effect.Instance)
+		}
+		applied = true
+		return nil
+	})
+	if err != nil || !applied {
+		return err
+	}
+	if effect.Quota != nil && r.state.ApplyProbeQuota(authID, effect.Instance, *effect.Quota) {
+		publishSchedulerState(r.state, highestTierSet(r.runtimeRoster()), now)
+	}
+	r.wakeRefreshLoop()
+	return nil
 }
 
 func (r *QuotaRefresher) weeklyActivationState(instance AuthInstanceID) (WeeklyActivationProbeState, bool) {
@@ -213,87 +337,6 @@ func (r *QuotaRefresher) weeklyActivationState(instance AuthInstanceID) (WeeklyA
 	}
 	state, ok := persisted.WeeklyActivationProbes[instance]
 	return state, ok
-}
-
-func (r *QuotaRefresher) markWeeklyActivationRetry(instance AuthInstanceID, err error) error {
-	if r == nil || r.runtimeStore == nil || instance == 0 {
-		return nil
-	}
-	now := r.now()
-	_, updateErr := r.runtimeStore.Update(func(persisted *PersistentState) error {
-		state := persisted.WeeklyActivationProbes[instance]
-		if state.State == WeeklyActivationManualRefreshRequired || state.State == WeeklyActivationConfirmed {
-			return nil
-		}
-		state.State = WeeklyActivationRetryWait
-		state.Attempts++
-		state.NextCheckAt = now.Add(probeBackoff(state.Attempts))
-		state.CooldownUntil = time.Time{}
-		if err != nil {
-			state.LastError = sanitizeResetProbeError(redactSecrets(err.Error()))
-		}
-		persisted.WeeklyActivationProbes[instance] = state
-		return nil
-	})
-	return updateErr
-}
-
-func (r *QuotaRefresher) markWeeklyActivationCooldown(instance AuthInstanceID, until time.Time, err error) error {
-	if r == nil || r.runtimeStore == nil || instance == 0 {
-		return nil
-	}
-	_, updateErr := r.runtimeStore.Update(func(persisted *PersistentState) error {
-		state := persisted.WeeklyActivationProbes[instance]
-		if state.State == WeeklyActivationManualRefreshRequired || state.State == WeeklyActivationConfirmed {
-			return nil
-		}
-		state.State = WeeklyActivationCooldown
-		state.CooldownUntil = until
-		state.NextCheckAt = time.Time{}
-		if err != nil {
-			state.LastError = sanitizeResetProbeError(redactSecrets(err.Error()))
-		}
-		persisted.WeeklyActivationProbes[instance] = state
-		return nil
-	})
-	return updateErr
-}
-
-func (r *QuotaRefresher) markWeeklyActivationManual(instance AuthInstanceID, resetAt time.Time, err error) error {
-	if r == nil || r.runtimeStore == nil || instance == 0 {
-		return nil
-	}
-	_, updateErr := r.runtimeStore.Update(func(persisted *PersistentState) error {
-		state := persisted.WeeklyActivationProbes[instance]
-		state.State = WeeklyActivationManualRefreshRequired
-		state.WeeklyResetAt = resetAt
-		state.NextCheckAt = time.Time{}
-		state.CooldownUntil = time.Time{}
-		if err != nil {
-			state.LastError = sanitizeResetProbeError(redactSecrets(err.Error()))
-		}
-		persisted.WeeklyActivationProbes[instance] = state
-		return nil
-	})
-	return updateErr
-}
-
-func (r *QuotaRefresher) markWeeklyActivationConfirmed(instance AuthInstanceID, resetAt, probeAt time.Time) error {
-	if r == nil || r.runtimeStore == nil || instance == 0 {
-		return nil
-	}
-	_, updateErr := r.runtimeStore.Update(func(persisted *PersistentState) error {
-		state := persisted.WeeklyActivationProbes[instance]
-		state.State = WeeklyActivationConfirmed
-		state.WeeklyResetAt = resetAt
-		state.CooldownUntil = time.Time{}
-		state.NextCheckAt = time.Time{}
-		state.LastProbeAt = probeAt
-		state.LastError = ""
-		persisted.WeeklyActivationProbes[instance] = state
-		return nil
-	})
-	return updateErr
 }
 
 func weeklyActivationPostSendEvidence(quota ParsedQuota) bool {

@@ -67,12 +67,15 @@ func (w *ProbeWAL) PersistSent(i AuthInstanceID, at time.Time, usageEvidence ...
 	})
 	return err
 }
-func (w *ProbeWAL) PersistSentUnknown(i AuthInstanceID, suppress time.Time) error {
+func (w *ProbeWAL) PersistSentUnknown(i AuthInstanceID, suppress time.Time, verifyNotBefore ...time.Time) error {
 	_, err := w.store.Update(func(s *PersistentState) error {
 		a := s.ProbeAttempts[i]
 		a.Phase = ProbeAttemptSentUnknown
 		if suppress.After(a.SuppressUntil) {
 			a.SuppressUntil = suppress
+		}
+		if len(verifyNotBefore) > 0 && verifyNotBefore[0].After(a.VerifyNotBefore) {
+			a.VerifyNotBefore = verifyNotBefore[0]
 		}
 		s.ProbeAttempts[i] = a
 		return nil

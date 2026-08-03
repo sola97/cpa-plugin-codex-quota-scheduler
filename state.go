@@ -222,6 +222,24 @@ func (s *PluginState) UpsertQuota(account AccountState) {
 	s.accounts[key] = cloneAccountState(account)
 }
 
+// ApplyProbeQuota records quota facts observed by a Probe without changing
+// refresh, circuit, trial, or temporary-account state.
+func (s *PluginState) ApplyProbeQuota(authID string, instance AuthInstanceID, quota ParsedQuota) bool {
+	if authID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, account, ok := s.findAccountLocked(authID, "")
+	if !ok || (instance != 0 && account.Instance != 0 && account.Instance != instance) {
+		return false
+	}
+	account.Quota = quota
+	account.Family = quota.Family
+	s.accounts[key] = cloneAccountState(account)
+	return true
+}
+
 func (s *PluginState) MarkAccountTemporaryExhausted(authID string, resetAt time.Time, reason string) {
 	if authID == "" {
 		return
