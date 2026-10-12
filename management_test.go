@@ -816,7 +816,7 @@ func TestStatusPageValidatesSchedulerPriorityBeforePatch(t *testing.T) {
 	validation := strings.Index(page, "if(!Number.isSafeInteger(schedulerPriority))")
 	// Anchor on the save-account PATCH body (togglePin sends scheduler_priority:priority
 	// and needs no user-input validation).
-	patch := strings.Index(page, "scheduler_priority:schedulerPriority}")
+	patch := strings.Index(page, "scheduler_priority:schedulerPriority")
 	if validation < 0 || patch < 0 || validation > patch {
 		t.Fatalf("scheduler priority validation must return before PATCH: validation=%d patch=%d", validation, patch)
 	}

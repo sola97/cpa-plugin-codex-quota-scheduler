@@ -7,6 +7,80 @@ provides a quota-aware, optimized Fill First scheduler for Codex accounts, so
 CPA selects accounts by real usability instead of relying on a static account
 order alone.
 
+## Per-Account Quota Reserves (sola97 Fork)
+
+Open an account's **Edit** dialog to set separate **5-hour reserve (%)** and
+**Weekly reserve (%)** values. Set both to `10` to stop assigning new requests
+when either window has 10% or less remaining. Legacy accounts default to `0`
+(disabled); enabling this fork does not silently change existing accounts.
+
+Each window also has editable **minutes before reset / reserve (%)** rows.
+Add, remove, or change as many rows as needed. The defaults are:
+
+| Window | Time Until Reset | Active Reserve |
+| --- | --- | --- |
+| 5-hour | More than 20 minutes | Configured base |
+| 5-hour | Last 20 minutes | 3% |
+| 5-hour | Last 10 minutes | 1% |
+| Weekly | More than 60 minutes | Configured base |
+| Weekly | Last 60 minutes | 10% |
+| Weekly | Last 30 minutes | 5% |
+| Weekly | Last 15 minutes | 3% |
+| Weekly | Last 5 minutes | 1% |
+
+The closest matching time row replaces the base percentage. Rows need not be
+entered in order. Timing is checked at every account selection, so a threshold
+can relax without waiting for another background refresh. The account card
+shows the active reserve. A base of `0` disables that window's reserve and its
+time rows. Delete every row to keep a fixed base reserve instead. Percentages
+are whole numbers from `0` to `100`; minutes are `1..300` for 5-hour windows and
+`1..10080` for weekly windows. Duplicate minute thresholds are rejected. Weekly
+rules do not apply to monthly quotas.
+
+Settings persist with account annotations and support JSON import/export. For
+example, PATCH `/v0/management/plugins/codex-quota-scheduler/annotations/account`:
+
+```json
+{
+  "auth_id": "your-codex-auth-id",
+  "five_hour_reserve_percent": 10,
+  "weekly_reserve_percent": 10,
+  "five_hour_reserve_steps": [
+    {"minutes_before_reset": 20, "reserve_percent": 3},
+    {"minutes_before_reset": 10, "reserve_percent": 1}
+  ],
+  "weekly_reserve_steps": [
+    {"minutes_before_reset": 60, "reserve_percent": 10},
+    {"minutes_before_reset": 30, "reserve_percent": 5},
+    {"minutes_before_reset": 15, "reserve_percent": 3},
+    {"minutes_before_reset": 5, "reserve_percent": 1}
+  ]
+}
+```
+
+PATCH preserves omitted settings; explicit empty step arrays disable time
+rows, while missing or `null` stored arrays use the defaults. Account edits
+take effect in the published scheduler before the save response returns.
+
+Keep plugin scheduling enabled. Protected accounts are excluded, and other
+eligible accounts can still be selected, including lower CPA priorities when
+cross-priority scheduling is enabled. If no account can be selected and the
+request offers any reserve-configured account, the plugin returns
+`quota_reserve_protected` instead of delegating to CPA's built-in fallback.
+Existing protected windows with missing usage wait for quota evidence; a
+successful read with no 5-hour window retains upstream's optional-window
+behavior. Reaching the local reset time alone never releases a quota block:
+new quota evidence must show capacity. The usual base applies again while
+waiting for the new cycle's evidence.
+
+These are scheduling thresholds based on reported quota, not an upstream
+transactional budget. Already-running requests, parallel requests admitted
+from the same reading, and usage outside CPA can consume past the threshold.
+For a larger practical buffer, increase the configured reserve or refresh more
+often. This change does not cancel an in-flight request.
+The optional reset-activation probe uses a separate background HTTP path; when
+enabled, its small activation requests are not stopped by scheduler reserves.
+
 ## v0.3.2 Highlights
 
 - Auth-failed accounts recover automatically. A 401/`invalid_grant` token

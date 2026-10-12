@@ -1002,6 +1002,12 @@ func cloneAnnotationState(state AnnotationState) AnnotationState {
 
 func cloneAccountAnnotation(annotation AccountAnnotation) AccountAnnotation {
 	annotation.Tags = cloneStringSlice(annotation.Tags)
+	if annotation.FiveHourReserveSteps != nil {
+		annotation.FiveHourReserveSteps = append([]QuotaReserveStep{}, annotation.FiveHourReserveSteps...)
+	}
+	if annotation.WeeklyReserveSteps != nil {
+		annotation.WeeklyReserveSteps = append([]QuotaReserveStep{}, annotation.WeeklyReserveSteps...)
+	}
 	return annotation
 }
 
@@ -1030,11 +1036,11 @@ func cloneResetProbes(probes map[WindowKind]ResetProbeState) map[WindowKind]Rese
 
 func cloneParsedQuota(quota ParsedQuota) ParsedQuota {
 	if quota.FiveHour != nil {
-		window := *quota.FiveHour
+		window := cloneQuotaWindows([]QuotaWindow{*quota.FiveHour})[0]
 		quota.FiveHour = &window
 	}
 	if quota.LongWindow != nil {
-		window := *quota.LongWindow
+		window := cloneQuotaWindows([]QuotaWindow{*quota.LongWindow})[0]
 		quota.LongWindow = &window
 	}
 	quota.CodeReviewWindows = cloneQuotaWindows(quota.CodeReviewWindows)

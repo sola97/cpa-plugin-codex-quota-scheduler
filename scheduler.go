@@ -10,6 +10,7 @@ import (
 type PickDecision struct {
 	AuthID          string
 	Handled         bool
+	Reject          bool
 	DelegateBuiltin string
 	Reason          string
 	Ordered         []ScheduledAccount
@@ -40,6 +41,7 @@ const (
 	QueueStatusFiveHourExhausted   QueueStatus = "five_hour_exhausted"
 	QueueStatusLongWindowExhausted QueueStatus = "long_window_exhausted"
 	QueueStatusUnavailable         QueueStatus = "unavailable"
+	QueueStatusReserved            QueueStatus = "reserved"
 )
 
 func HighestPriorityCodexAdmission(req pluginapi.SchedulerPickRequest) (CPAAdmissionState, bool) {
@@ -109,6 +111,13 @@ func PickCodexAccount(req pluginapi.SchedulerPickRequest, snapshot StateSnapshot
 		}
 	}
 
+	candidates := make([]Candidate, 0, len(req.Candidates))
+	for _, candidate := range req.Candidates {
+		candidates = append(candidates, Candidate{ID: candidate.ID, Provider: candidate.Provider})
+	}
+	if schedulerRequestHasQuotaReserve(*schedulerSnapshotFromState(snapshot, nil), candidates) {
+		return PickDecision{Handled: true, Reject: true, Reason: "quota_reserve_protected", Ordered: ordered}
+	}
 	if snapshot.Config.Fallback == FallbackFillFirst {
 		return PickDecision{
 			Handled:         true,
@@ -168,12 +177,14 @@ func buildOrderedAccounts(req pluginapi.SchedulerPickRequest, snapshot StateSnap
 
 		account, ok := accountsByAuthID[candidate.ID]
 		if !ok {
+			annotation := snapshot.Annotations.Accounts["auth:"+candidate.ID]
 			ordered = append(ordered, ScheduledAccount{
 				AuthID:            candidate.ID,
 				CPAPriority:       candidatePriority,
 				Family:            AccountFamilyUnknown,
 				QueueStatus:       QueueStatusUnavailable,
 				UnavailableReason: "unknown_account",
+				Annotation:        annotation,
 				selectionClass:    Excluded,
 				selectionView:     AccountView{ID: candidate.ID},
 			})
@@ -241,6 +252,9 @@ func accountAvailable(account AccountState, now time.Time) (bool, string) {
 }
 
 func accountQueueState(account AccountState, now time.Time) (QueueStatus, bool, string, time.Time) {
+	if reason := accountReservationReason(account, now); reason != "" {
+		return QueueStatusReserved, false, reason, accountSortTime(account)
+	}
 	if account.Refresh.AuthFailure {
 		return QueueStatusUnavailable, false, "auth_failure", time.Time{}
 	}

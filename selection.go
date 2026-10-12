@@ -56,6 +56,7 @@ type AccountView struct {
 	Expiry               time.Time
 	RemainingQuota       float64
 	QuotaPressure        float64
+	Reservation          QuotaReservation
 }
 
 type Candidate struct{ ID, Provider string }
@@ -72,6 +73,9 @@ type SelectionResult struct {
 }
 
 func ClassifyAccount(a AccountView, now time.Time) AvailabilityClass {
+	if reservationReason(a.Reservation, now) != "" {
+		return Excluded
+	}
 	if a.AuthBlocked || a.Circuit == CircuitOpen || a.TemporaryUnavailable || a.Trial != TrialNone {
 		return Excluded
 	}

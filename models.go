@@ -107,11 +107,20 @@ type ResetProbeState struct {
 }
 
 type AccountAnnotation struct {
-	Alias             string   `json:"alias,omitempty" yaml:"alias,omitempty"`
-	Notes             string   `json:"notes,omitempty" yaml:"notes,omitempty"`
-	Tags              []string `json:"tags,omitempty" yaml:"tags,omitempty"`
-	GroupID           string   `json:"group_id,omitempty" yaml:"group_id,omitempty"`
-	SchedulerPriority int      `json:"scheduler_priority,omitempty" yaml:"scheduler_priority,omitempty"`
+	Alias                  string             `json:"alias,omitempty" yaml:"alias,omitempty"`
+	Notes                  string             `json:"notes,omitempty" yaml:"notes,omitempty"`
+	Tags                   []string           `json:"tags,omitempty" yaml:"tags,omitempty"`
+	GroupID                string             `json:"group_id,omitempty" yaml:"group_id,omitempty"`
+	SchedulerPriority      int                `json:"scheduler_priority,omitempty" yaml:"scheduler_priority,omitempty"`
+	FiveHourReservePercent int                `json:"five_hour_reserve_percent,omitempty" yaml:"five_hour_reserve_percent,omitempty"`
+	WeeklyReservePercent   int                `json:"weekly_reserve_percent,omitempty" yaml:"weekly_reserve_percent,omitempty"`
+	FiveHourReserveSteps   []QuotaReserveStep `json:"five_hour_reserve_steps" yaml:"five_hour_reserve_steps"`
+	WeeklyReserveSteps     []QuotaReserveStep `json:"weekly_reserve_steps" yaml:"weekly_reserve_steps"`
+}
+
+type QuotaReserveStep struct {
+	MinutesBeforeReset int `json:"minutes_before_reset" yaml:"minutes_before_reset"`
+	ReservePercent     int `json:"reserve_percent" yaml:"reserve_percent"`
 }
 
 type GroupAnnotation struct {

@@ -11,16 +11,17 @@ import (
 )
 
 type SchedulerSnapshot struct {
-	HandleEnabled     bool
-	Fallback          FallbackMode
-	MonthlyMode       MonthlyMode
-	Accounts          []AccountView
-	ActiveHighestTier map[string]struct{}
-	Trials            *TrialRegistry
-	EvidenceIntents   chan<- EvidenceIntent
-	AdmissionVersion  uint64
-	Activity          func(pluginapi.SchedulerPickRequest, uint64, time.Time)
-	Observation       func(pluginapi.SchedulerPickRequest, PickDecision, time.Time)
+	HandleEnabled      bool
+	Fallback           FallbackMode
+	MonthlyMode        MonthlyMode
+	Accounts           []AccountView
+	ActiveHighestTier  map[string]struct{}
+	Trials             *TrialRegistry
+	EvidenceIntents    chan<- EvidenceIntent
+	AdmissionVersion   uint64
+	Activity           func(pluginapi.SchedulerPickRequest, uint64, time.Time)
+	Observation        func(pluginapi.SchedulerPickRequest, PickDecision, time.Time)
+	ReserveAnnotations map[string]AccountAnnotation
 }
 
 type EvidenceIntent struct {
@@ -41,6 +42,13 @@ func PublishSchedulerSnapshot(snapshot *SchedulerSnapshot) {
 func cloneSchedulerSnapshot(s SchedulerSnapshot) SchedulerSnapshot {
 	s.Accounts = append([]AccountView(nil), s.Accounts...)
 	s.ActiveHighestTier = cloneStringSet(s.ActiveHighestTier)
+	s.ReserveAnnotations = cloneAnnotationState(AnnotationState{Accounts: s.ReserveAnnotations}).Accounts
+	for i := range s.Accounts {
+		r := &s.Accounts[i].Reservation
+		r.Annotation = cloneAccountAnnotation(r.Annotation)
+		quota := cloneParsedQuota(ParsedQuota{FiveHour: r.FiveHour, LongWindow: r.LongWindow})
+		r.FiveHour, r.LongWindow = quota.FiveHour, quota.LongWindow
+	}
 	return s
 }
 func cloneStringSet(in map[string]struct{}) map[string]struct{} {
@@ -88,10 +96,49 @@ func schedulerPickPublished(req pluginapi.SchedulerPickRequest, now time.Time) P
 	if result.AuthID != "" {
 		return observeSchedulerDecision(snapshot, req, PickDecision{AuthID: result.AuthID, Handled: true, Reason: "selected"}, now)
 	}
+	if schedulerRequestHasQuotaReserve(*snapshot, candidates) {
+		return observeSchedulerDecision(snapshot, req, PickDecision{Handled: true, Reject: true, Reason: "quota_reserve_protected", UnavailableSummary: fallbackUnavailableSummary(*snapshot, candidates, now)}, now)
+	}
 	if snapshot.Fallback == FallbackFillFirst {
 		return observeSchedulerDecision(snapshot, req, PickDecision{Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinFillFirst, Reason: result.Reason, UnavailableSummary: fallbackUnavailableSummary(*snapshot, candidates, now)}, now)
 	}
 	return observeSchedulerDecision(snapshot, req, PickDecision{Reason: result.Reason}, now)
+}
+
+// Built-in fallback sees the original candidate list, including protected
+// accounts outside the current admission tier or without a quota snapshot.
+func schedulerRequestHasQuotaReserve(snapshot SchedulerSnapshot, candidates []Candidate) bool {
+	unresolvedIdentityReserve := false
+	for key, annotation := range snapshot.ReserveAnnotations {
+		if !strings.HasPrefix(key, "auth:") && hasQuotaReserve(annotation) {
+			unresolvedIdentityReserve = true
+			break
+		}
+	}
+	for _, candidate := range candidates {
+		if candidate.Provider != "codex" || candidate.ID == "" {
+			continue
+		}
+		if hasQuotaReserve(snapshot.ReserveAnnotations["auth:"+candidate.ID]) {
+			return true
+		}
+		known := false
+		for _, account := range snapshot.Accounts {
+			if account.ID == candidate.ID {
+				known = true
+				if hasQuotaReserve(account.Reservation.Annotation) {
+					return true
+				}
+				break
+			}
+		}
+		// Instance-keyed annotations cannot be matched before roster hydration.
+		// Let verified accounts win, but do not let fallback guess this identity.
+		if !known && unresolvedIdentityReserve {
+			return true
+		}
+	}
+	return false
 }
 
 // fallbackUnavailableSummary explains why no account was selectable. The pick
@@ -127,6 +174,9 @@ func fallbackUnavailableSummary(snapshot SchedulerSnapshot, candidates []Candida
 }
 
 func accountExclusionReason(a AccountView, now time.Time) string {
+	if reason := reservationReason(a.Reservation, now); reason != "" {
+		return reason
+	}
 	switch {
 	case a.AuthBlocked:
 		return "auth_failure"
@@ -166,7 +216,7 @@ func schedulerSnapshotFromState(state StateSnapshot, trials *TrialRegistry) *Sch
 		activity = pump.enqueue
 		observation = pump.enqueueObservation
 	}
-	return &SchedulerSnapshot{HandleEnabled: state.Config.HandleEnabled, Fallback: state.Config.Fallback, MonthlyMode: state.Config.MonthlyMode, Accounts: accounts, ActiveHighestTier: active, Trials: trials, EvidenceIntents: globalEvidenceIntents, Activity: activity, Observation: observation}
+	return &SchedulerSnapshot{HandleEnabled: state.Config.HandleEnabled, Fallback: state.Config.Fallback, MonthlyMode: state.Config.MonthlyMode, Accounts: accounts, ActiveHighestTier: active, Trials: trials, EvidenceIntents: globalEvidenceIntents, Activity: activity, Observation: observation, ReserveAnnotations: state.Annotations.Accounts}
 }
 
 func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *TrialRegistry) AccountView {
@@ -197,6 +247,7 @@ func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *Tri
 		ResetAt: reset, AuthBlocked: a.Refresh.AuthFailure, Circuit: circuitClass,
 		TemporaryUnavailable: a.TemporaryExhausted && a.TemporaryResetAt.After(now),
 		Trial:                trial, Expiry: accountSortTime(a), RemainingQuota: remainingQuota(a), QuotaPressure: quotaPressure(a, now),
+		Reservation: accountReservationState(a),
 	}
 }
 

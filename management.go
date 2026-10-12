@@ -143,6 +143,12 @@ type StatusAccount struct {
 	Tags                         []string               `json:"tags,omitempty"`
 	CPAPriority                  int                    `json:"cpa_priority"`
 	SchedulerPriority            int                    `json:"scheduler_priority"`
+	FiveHourReservePercent       int                    `json:"five_hour_reserve_percent"`
+	WeeklyReservePercent         int                    `json:"weekly_reserve_percent"`
+	FiveHourReserveSteps         []QuotaReserveStep     `json:"five_hour_reserve_steps"`
+	WeeklyReserveSteps           []QuotaReserveStep     `json:"weekly_reserve_steps"`
+	FiveHourEffectiveReserve     int                    `json:"five_hour_effective_reserve_percent"`
+	WeeklyEffectiveReserve       int                    `json:"weekly_effective_reserve_percent"`
 	Family                       AccountFamily          `json:"family"`
 	QueueStatus                  QueueStatus            `json:"queue_status"`
 	Available                    bool                   `json:"available"`
@@ -649,6 +655,9 @@ func handleImportState(store *PluginState, body []byte, now time.Time) pluginapi
 	if _, err := validateQuotaEndpoint(state.Config.QuotaEndpoint); err != nil {
 		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
+	if err := validateQuotaReserves(state.Accounts); err != nil {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
 	state = normalizePluginDiskState(state)
 	if err := SaveUserData(semanticStatePaths(defaultStatePath()).UserData, state); err != nil {
 		return jsonManagementResponse(http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -656,12 +665,27 @@ func handleImportState(store *PluginState, body []byte, now time.Time) pluginapi
 	store.ReplaceConfig(state.Config)
 	currentConfig.Store(state.Config)
 	store.SetAnnotations(AnnotationState{Accounts: state.Accounts, Groups: state.Groups})
+	publishSchedulerState(store, nil, now)
 	store.RecordLog("info", "ui.config_imported", "页面导入插件配置", nil, now)
 	return jsonManagementResponse(http.StatusOK, map[string]bool{"ok": true})
 }
 
 func BuildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount) StatusPayload {
 	return buildStatusPayload(snapshot, ordered, nil)
+}
+
+func cloneQuotaReserveSteps(steps []QuotaReserveStep) []QuotaReserveStep {
+	if steps == nil {
+		return nil
+	}
+	return append(make([]QuotaReserveStep, 0, len(steps)), steps...)
+}
+
+func weeklyQuotaWindow(account AccountState) *QuotaWindow {
+	if account.Quota.LongWindow != nil && account.Quota.LongWindow.Kind == WindowWeekly {
+		return account.Quota.LongWindow
+	}
+	return nil
 }
 
 func buildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount, lifecycle *ManagementLifecycleSnapshot) StatusPayload {
@@ -719,27 +743,33 @@ func buildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount, life
 		}
 
 		status := StatusAccount{
-			Rank:              i + 1,
-			AuthID:            scheduled.AuthID,
-			Alias:             scheduled.Annotation.Alias,
-			Notes:             scheduled.Annotation.Notes,
-			GroupID:           groupID,
-			Group:             groupName,
-			GroupNotes:        groupNotes,
-			Tags:              cloneStringSlice(scheduled.Annotation.Tags),
-			CPAPriority:       scheduled.CPAPriority,
-			SchedulerPriority: scheduled.SchedulerPriority,
-			Family:            scheduled.Family,
-			QueueStatus:       scheduled.QueueStatus,
-			Available:         scheduled.Available,
-			UnavailableReason: scheduled.UnavailableReason,
-			ResetExpiry:       scheduled.SortTime,
-			ResetExpiryText:   formatTime(scheduled.SortTime),
-			LastError:         account.LastError,
-			NextRetryText:     formatTime(account.Refresh.NextRetryAt),
-			AuthFailure:       account.Refresh.AuthFailure,
-			FiveHour:          statusWindow(account.Quota.FiveHour, "5 小时额度"),
-			LongWindow:        statusWindow(account.Quota.LongWindow, longWindowLabelCN(account.Family)),
+			Rank:                     i + 1,
+			AuthID:                   scheduled.AuthID,
+			Alias:                    scheduled.Annotation.Alias,
+			Notes:                    scheduled.Annotation.Notes,
+			GroupID:                  groupID,
+			Group:                    groupName,
+			GroupNotes:               groupNotes,
+			Tags:                     cloneStringSlice(scheduled.Annotation.Tags),
+			CPAPriority:              scheduled.CPAPriority,
+			SchedulerPriority:        scheduled.SchedulerPriority,
+			FiveHourReservePercent:   scheduled.Annotation.FiveHourReservePercent,
+			WeeklyReservePercent:     scheduled.Annotation.WeeklyReservePercent,
+			FiveHourReserveSteps:     cloneQuotaReserveSteps(scheduled.Annotation.FiveHourReserveSteps),
+			WeeklyReserveSteps:       cloneQuotaReserveSteps(scheduled.Annotation.WeeklyReserveSteps),
+			FiveHourEffectiveReserve: effectiveQuotaReserve(scheduled.Annotation.FiveHourReservePercent, scheduled.Annotation.FiveHourReserveSteps, WindowFiveHour, account.Quota.FiveHour, snapshot.Now),
+			WeeklyEffectiveReserve:   effectiveQuotaReserve(scheduled.Annotation.WeeklyReservePercent, scheduled.Annotation.WeeklyReserveSteps, WindowWeekly, weeklyQuotaWindow(account), snapshot.Now),
+			Family:                   scheduled.Family,
+			QueueStatus:              scheduled.QueueStatus,
+			Available:                scheduled.Available,
+			UnavailableReason:        scheduled.UnavailableReason,
+			ResetExpiry:              scheduled.SortTime,
+			ResetExpiryText:          formatTime(scheduled.SortTime),
+			LastError:                account.LastError,
+			NextRetryText:            formatTime(account.Refresh.NextRetryAt),
+			AuthFailure:              account.Refresh.AuthFailure,
+			FiveHour:                 statusWindow(account.Quota.FiveHour, "5 小时额度"),
+			LongWindow:               statusWindow(account.Quota.LongWindow, longWindowLabelCN(account.Family)),
 		}
 		_, status.RefreshDueReason = accountRefreshDue(account, snapshot.Config, snapshot.Now)
 		status.StatusNote = accountStatusNote(account, status.RefreshDueReason, snapshot, payload.RefreshActive)
@@ -1213,10 +1243,14 @@ func handlePutAnnotations(store *PluginState, req pluginapi.ManagementRequest) p
 		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 	state = NormalizeAnnotationState(state)
+	if err := validateQuotaReserves(state.Accounts); err != nil {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
 	if err := persistAnnotationState(store, state); err != nil {
 		return jsonManagementResponse(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 	store.SetAnnotations(state)
+	publishSchedulerState(store, nil, time.Now())
 	return jsonManagementResponse(http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -1234,6 +1268,16 @@ func handlePatchAccountAnnotation(store *PluginState, req pluginapi.ManagementRe
 
 func applyAccountAnnotationPatch(store *PluginState, patch annotationPatch) pluginapi.ManagementResponse {
 	key := patch.accountKey()
+	if patch.Key == "" && patch.ID == "" && patch.AuthID != "" {
+		for _, account := range store.Snapshot(time.Now()).Accounts {
+			if account.AuthID == patch.AuthID {
+				if resolved := ResolveAnnotationKey(account); resolved != "" {
+					key = resolved
+				}
+				break
+			}
+		}
+	}
 	if key == "" {
 		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": "annotation key is required"})
 	}
@@ -1260,12 +1304,28 @@ func applyAccountAnnotationPatch(store *PluginState, patch annotationPatch) plug
 	if patch.SchedulerPriority != nil {
 		annotation.SchedulerPriority = *patch.SchedulerPriority
 	}
+	if patch.FiveHourReservePercent != nil {
+		annotation.FiveHourReservePercent = *patch.FiveHourReservePercent
+	}
+	if patch.WeeklyReservePercent != nil {
+		annotation.WeeklyReservePercent = *patch.WeeklyReservePercent
+	}
+	if patch.FiveHourReserveSteps != nil {
+		annotation.FiveHourReserveSteps = cloneQuotaReserveSteps(*patch.FiveHourReserveSteps)
+	}
+	if patch.WeeklyReserveSteps != nil {
+		annotation.WeeklyReserveSteps = cloneQuotaReserveSteps(*patch.WeeklyReserveSteps)
+	}
 	state.Accounts[key] = annotation
 	state = NormalizeAnnotationState(state)
+	if err := validateQuotaReserves(state.Accounts); err != nil {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
 	if err := persistAnnotationState(store, state); err != nil {
 		return jsonManagementResponse(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 	store.SetAnnotations(state)
+	publishSchedulerState(store, nil, time.Now())
 	return jsonManagementResponse(http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -1312,21 +1372,26 @@ func applyGroupAnnotationPatch(store *PluginState, patch annotationPatch) plugin
 		return jsonManagementResponse(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 	store.SetAnnotations(state)
+	publishSchedulerState(store, nil, time.Now())
 	return jsonManagementResponse(http.StatusOK, map[string]bool{"ok": true})
 }
 
 type annotationPatch struct {
-	Key               string          `json:"key"`
-	ID                string          `json:"id"`
-	AuthID            string          `json:"auth_id"`
-	Alias             *string         `json:"alias"`
-	Name              *string         `json:"name"`
-	Notes             *string         `json:"notes"`
-	Tags              []string        `json:"tags"`
-	GroupID           *string         `json:"group_id"`
-	SchedulerPriority *int            `json:"scheduler_priority"`
-	Color             *string         `json:"color"`
-	Annotation        json.RawMessage `json:"annotation"`
+	Key                    string              `json:"key"`
+	ID                     string              `json:"id"`
+	AuthID                 string              `json:"auth_id"`
+	Alias                  *string             `json:"alias"`
+	Name                   *string             `json:"name"`
+	Notes                  *string             `json:"notes"`
+	Tags                   []string            `json:"tags"`
+	GroupID                *string             `json:"group_id"`
+	SchedulerPriority      *int                `json:"scheduler_priority"`
+	FiveHourReservePercent *int                `json:"five_hour_reserve_percent"`
+	WeeklyReservePercent   *int                `json:"weekly_reserve_percent"`
+	FiveHourReserveSteps   *[]QuotaReserveStep `json:"five_hour_reserve_steps"`
+	WeeklyReserveSteps     *[]QuotaReserveStep `json:"weekly_reserve_steps"`
+	Color                  *string             `json:"color"`
+	Annotation             json.RawMessage     `json:"annotation"`
 }
 
 func (p annotationPatch) accountKey() string {
@@ -1427,6 +1492,7 @@ var statusTemplateV2 = template.Must(template.New("status-v2").Funcs(template.Fu
 .warning{margin-top:14px;border:1px solid #fbbf24;background:#fffbeb;color:#78350f;border-radius:7px;padding:10px 11px;font-size:12px;line-height:1.45}.warning strong{display:block;color:#92400e;font-size:13px;margin-bottom:3px}
 *{box-sizing:border-box}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;color:#1f2937;background:#f6f7f9}button,input,select,textarea{font:inherit}button{border:0;border-radius:7px;padding:9px 12px;background:#2563eb;color:#fff;cursor:pointer;font-weight:650}button.secondary{background:#eef2ff;color:#1e40af}button.ghost{background:#f3f4f6;color:#374151}button:disabled{opacity:.55;cursor:not-allowed}[hidden]{display:none!important}code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}.shell{display:grid;grid-template-columns:310px minmax(0,1fr);min-height:100vh}.sidebar{background:#fff;border-right:1px solid #e5e7eb;padding:18px;position:sticky;top:0;height:100vh;overflow:auto}.main{padding:20px 22px 32px;overflow:auto}.brand{display:grid;gap:5px;margin-bottom:18px}.brand h1{font-size:20px;line-height:1.2;margin:0;color:#111827}.brand p{font-size:12px;line-height:1.45;color:#6b7280;margin:0}.section{border-top:1px solid #eef0f3;padding-top:16px;margin-top:16px}.section h2{font-size:14px;margin:0 0 12px;color:#111827}.collapsible summary{cursor:pointer;list-style:none;display:flex;align-items:flex-start;gap:8px}.collapsible summary::-webkit-details-marker{display:none}.summary-toggle{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:999px;background:#eef2ff;color:#1e40af;font-weight:750;line-height:1;transition:transform .16s ease}.collapsible[open] .summary-toggle{transform:rotate(90deg)}.summary-text{display:grid;gap:3px}.summary-title{font-size:14px;font-weight:750;color:#111827}.summary-subtitle{font-size:12px;line-height:1.35;color:#6b7280}.collapsible-body{padding-top:14px}.primary-actions{margin-top:12px}.field{display:grid;gap:6px;margin-bottom:12px}.field span{font-size:12px;color:#4b5563;font-weight:650}.field input,.field select,.field textarea{width:100%;border:1px solid #d1d5db;border-radius:7px;background:#fff;color:#111827;padding:8px 10px}.field textarea{min-height:84px;resize:vertical}.toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}.toggle span{font-size:13px;font-weight:650}.setting-with-help{margin-bottom:12px}.setting-with-help .toggle{margin-bottom:4px}.setting-help{margin:0;color:#6b7280;font-size:12px;line-height:1.45}.actions{display:flex;gap:8px;flex-wrap:wrap}.notice{margin-top:12px;border-radius:7px;padding:10px 11px;background:#ecfdf5;color:#065f46;font-size:12px;line-height:1.45}.notice.error{background:#fef2f2;color:#991b1b}.staticHint{background:#eff6ff;color:#1e3a8a}.toolbar{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}.toolbar h2{font-size:22px;margin:0;color:#111827}.toolbar p{font-size:13px;color:#6b7280;margin:5px 0 0}.metrics{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.metric{border:1px solid #e5e7eb;background:#fff;border-radius:7px;padding:8px 10px;font-size:12px;color:#374151}.queue{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:12px}.card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:14px;display:grid;gap:12px;box-shadow:0 1px 2px rgba(15,23,42,.04)}.card.next{border-color:#2563eb;box-shadow:0 0 0 1px rgba(37,99,235,.18),0 8px 24px rgba(37,99,235,.08)}.cardTop{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.rank{display:inline-flex;align-items:center;justify-content:center;min-width:30px;height:30px;border-radius:7px;background:#111827;color:#fff;font-weight:750;font-size:13px}.identity{min-width:0;display:grid;gap:5px}.titleLine{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.title{font-weight:750;color:#111827;overflow-wrap:anywhere}.groupPill{border-radius:999px;background:#f0fdf4;color:#166534;padding:3px 7px;font-size:11px}.sub{font-size:12px;color:#6b7280;overflow-wrap:anywhere}.badges{display:flex;gap:6px;flex-wrap:wrap}.badge{border-radius:999px;background:#f3f4f6;color:#374151;padding:4px 8px;font-size:12px}.badge.ok{background:#dcfce7;color:#166534}.badge.no{background:#fee2e2;color:#991b1b}.badge.next{background:#dbeafe;color:#1d4ed8}.kv{display:grid;grid-template-columns:88px minmax(0,1fr);gap:6px 10px;font-size:12px}.kv span:nth-child(odd){color:#6b7280}.kv span:nth-child(even){color:#111827;overflow-wrap:anywhere}.chips{display:flex;gap:6px;flex-wrap:wrap;min-height:24px}.chip{border-radius:999px;background:#eef2ff;color:#3730a3;padding:4px 8px;font-size:12px}.quotaList{display:grid;gap:10px}.quota-row{display:grid;gap:5px}.quota-head{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;font-size:12px;color:#374151}.quota-title{font-weight:650;color:#111827}.quota-reset{grid-column:1/-1;color:#6b7280}.localTime{color:#374151}.quota-bar{height:8px;border-radius:999px;background:#e5e7eb;overflow:hidden}.quota-fill{height:100%;border-radius:999px;background:#2f7d5f}.quota-fill.warn{background:#b7791f}.quota-fill.danger{background:#dc2626}.metaLine{display:flex;gap:6px;flex-wrap:wrap}.noteBlock{font-size:12px;line-height:1.45;color:#4b5563;background:#f9fafb;border-radius:7px;padding:8px 9px;display:grid;gap:3px}.cardActions{display:flex;justify-content:flex-end;gap:8px}.pinAccount{display:inline-flex;align-items:center;justify-content:center;padding:9px;color:#6b7280}.pinAccount.pinned{background:#dbeafe;color:#2563eb}.pinAccount svg{width:18px;height:18px;fill:currentColor}.empty{background:#fff;border:1px dashed #d1d5db;border-radius:8px;padding:28px;text-align:center;color:#6b7280}.logs{margin-top:20px;background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:14px}.logsHeader{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}.logsHeader h2{font-size:16px;margin:0}.logList{display:grid;gap:8px;max-height:260px;overflow:auto}.logItem{border-left:3px solid #d1d5db;padding:7px 9px;background:#f9fafb;border-radius:0 7px 7px 0}.logItem.info{border-left-color:#2563eb}.logItem.warn{border-left-color:#b7791f}.logItem.error{border-left-color:#dc2626}.logMeta{font-size:11px;color:#6b7280;margin-bottom:3px}.logMsg{font-size:12px;color:#111827;line-height:1.45}dialog{border:0;border-radius:8px;padding:0;width:min(560px,calc(100vw - 28px));box-shadow:0 24px 64px rgba(15,23,42,.28)}dialog::backdrop{background:rgba(15,23,42,.38)}.dialogBody{padding:18px}.dialogHead{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:14px}.dialogHead h2{font-size:18px;margin:0;color:#111827}.dialogHead p{font-size:12px;color:#6b7280;margin:4px 0 0}.dialogGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.dialogGrid .wide{grid-column:1/-1}.dialogActions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}@media(max-width:860px){.shell{grid-template-columns:1fr}.sidebar{height:auto;position:relative;border-right:0;border-bottom:1px solid #e5e7eb}.toolbar{display:grid}.metrics{justify-content:flex-start}.dialogGrid{grid-template-columns:1fr}}
 .quota-fill.warn{background:#f59e0b}
+#editDialog{max-height:calc(100dvh - 28px);overflow:auto}#editDialog .dialogActions{position:sticky;bottom:-18px;background:#fff;padding:12px 0 18px;margin-bottom:-18px;border-top:1px solid #e5e7eb}.reserveRuleList{display:grid;gap:8px}.reserveRuleRow .field{min-width:0}
 .retryChainHead{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:6px 0 8px}.retryChainHead h3{margin:0;font-size:15px;color:#111827}
 .retryChainRow{border:1px solid #e5e7eb;border-radius:8px;padding:12px;margin-bottom:10px;background:#fbfbfd;display:grid;gap:10px}
 .retryChainRowHead{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:end}.retryChainRowHead .field{margin-bottom:0}
@@ -1520,7 +1586,7 @@ var statusTemplateV2 = template.Must(template.New("status-v2").Funcs(template.Fu
 <section class="logs"><div class="logsHeader"><h2 data-i18n="logs.title">调度日志</h2><div class="actions"><button id="refreshLogs" type="button" class="ghost" data-i18n="actions.refreshLogs">刷新日志</button><button id="exportLogs" type="button" class="ghost" data-i18n="actions.exportLogs">导出日志</button></div></div><div id="logList" class="logList"></div></section>
 </main>
 </div>
-<dialog id="editDialog"><form method="dialog" class="dialogBody"><div class="dialogHead"><div><h2 data-i18n="edit.title">编辑账号</h2><p id="editAuthID"></p></div><button type="button" id="closeDialog" class="ghost" data-i18n="actions.close">关闭</button></div><div class="dialogGrid"><label class="field"><span data-i18n="edit.alias">别名</span><input id="editAlias"></label><label class="field"><span data-i18n="account.schedulerPriority">插件优先级</span><input id="editSchedulerPriority" type="number" step="1" value="0"></label><label class="field"><span data-i18n="edit.groupID">分组 ID</span><input id="editGroupID" placeholder="team-a"></label><label class="field"><span data-i18n="edit.groupName">分组名称</span><input id="editGroupName"></label><label class="field"><span data-i18n="edit.tags">标签</span><input id="editTags" placeholder="team, paid"></label><label class="field wide"><span data-i18n="edit.notes">账号备注</span><textarea id="editNotes"></textarea></label><label class="field wide"><span data-i18n="edit.groupNotes">分组备注</span><textarea id="editGroupNotes"></textarea></label></div><div class="dialogActions"><button type="button" id="saveAccount" class="secondary" data-i18n="actions.saveAccount">保存账号</button><button type="button" id="cancelEdit" class="ghost" data-i18n="actions.cancel">取消</button></div></form></dialog>
+<dialog id="editDialog"><form method="dialog" class="dialogBody"><div class="dialogHead"><div><h2 data-i18n="edit.title">编辑账号</h2><p id="editAuthID"></p></div><button type="button" id="closeDialog" class="ghost" data-i18n="actions.close">关闭</button></div><div class="dialogGrid"><label class="field"><span data-i18n="edit.alias">别名</span><input id="editAlias"></label><label class="field"><span data-i18n="account.schedulerPriority">插件优先级</span><input id="editSchedulerPriority" type="number" step="1" value="0"></label><label class="field"><span data-i18n="edit.fiveHourReserve">5 小时基础保留比例（%）</span><input id="five_hourReservePercent" type="number" min="0" max="100" step="1"></label><label class="field"><span data-i18n="edit.weeklyReserve">每周基础保留比例（%）</span><input id="weeklyReservePercent" type="number" min="0" max="100" step="1"></label><div class="field wide"><div class="cardTop"><span data-i18n="edit.fiveHourSteps">5 小时时间规则</span><button type="button" id="addFiveHourReserveRule" class="ghost" data-i18n="edit.addRule">添加规则</button></div><div id="five_hourReserveRules" class="reserveRuleList"></div></div><div class="field wide"><div class="cardTop"><span data-i18n="edit.weeklySteps">每周时间规则</span><button type="button" id="addWeeklyReserveRule" class="ghost" data-i18n="edit.addRule">添加规则</button></div><div id="weeklyReserveRules" class="reserveRuleList"></div></div><label class="field"><span data-i18n="edit.groupID">分组 ID</span><input id="editGroupID" placeholder="team-a"></label><label class="field"><span data-i18n="edit.groupName">分组名称</span><input id="editGroupName"></label><label class="field wide"><span data-i18n="edit.tags">标签</span><input id="editTags" placeholder="team, paid"></label><label class="field wide"><span data-i18n="edit.notes">账号备注</span><textarea id="editNotes"></textarea></label><label class="field wide"><span data-i18n="edit.groupNotes">分组备注</span><textarea id="editGroupNotes"></textarea></label></div><div id="editReserveError" class="notice error" role="alert" hidden></div><div class="dialogActions"><button type="button" id="saveAccount" class="secondary" data-i18n="actions.saveAccount">保存账号</button><button type="button" id="cancelEdit" class="ghost" data-i18n="actions.cancel">取消</button></div></form></dialog>
 <script>
 let STATUS={{json .}};
 const MANAGEMENT_BASE='/v0/management/plugins/codex-quota-scheduler';
@@ -1569,6 +1635,18 @@ TRANSLATIONS.en['retry.cpaConfirmYes']='Apply recommended settings';
 TRANSLATIONS.en['retry.cpaConfirmNo']='Cancel';
 TRANSLATIONS.en['retry.cpaConfirmBody']='Current: request-retry={requestRetry}, buffering={buffering}, timeout={timeout}, bootstrap-retries={bootstrapRetries}. Recommended: request-retry=3, buffering=true, timeout="0", bootstrap-retries=1.';
 TRANSLATIONS.en['retry.cpaNoChanges']='No changes made.';
+TRANSLATIONS.en['edit.fiveHourReserve']='5-hour base reserve (%)';
+TRANSLATIONS.en['edit.weeklyReserve']='Weekly base reserve (%)';
+TRANSLATIONS.en['edit.fiveHourSteps']='5-hour time-step rules';
+TRANSLATIONS.en['edit.weeklySteps']='Weekly time-step rules';
+TRANSLATIONS.en['edit.minutesBeforeReset']='Minutes before reset';
+TRANSLATIONS.en['edit.reservePercent']='Reserve (%)';
+TRANSLATIONS.en['edit.addRule']='Add rule';
+TRANSLATIONS.en['edit.removeRule']='Remove rule';
+TRANSLATIONS.en['error.reserveInteger']='Reserve values must be whole numbers from 0 to 100; rule minutes must be in range and unique.';
+TRANSLATIONS.en['reason.five_hour_reserved']='5-hour reserve';
+TRANSLATIONS.en['reason.weekly_reserved']='Weekly reserve';
+TRANSLATIONS.en['reason.reserve_quota_unknown']='Quota unknown while reserve is enabled';
 TRANSLATIONS.en['log.retry.attempt_started']='Retry chain attempt started';
 TRANSLATIONS.en['log.retry.retry_scheduled']='Retry scheduled after a retryable upstream failure';
 TRANSLATIONS.en['log.retry.aborted']='Retry stopped because the upstream failure was not retryable';
@@ -1592,6 +1670,20 @@ TRANSLATIONS['zh-CN']['retry.cpaConfirmYes']='应用推荐设置';
 TRANSLATIONS['zh-CN']['retry.cpaConfirmNo']='取消';
 TRANSLATIONS['zh-CN']['retry.cpaConfirmBody']='当前值：request-retry={requestRetry}，buffering={buffering}，timeout={timeout}，bootstrap-retries={bootstrapRetries}。推荐值：request-retry=3，buffering=true，timeout="0"，bootstrap-retries=1。';
 TRANSLATIONS['zh-CN']['retry.cpaNoChanges']='未做任何修改。';
+TRANSLATIONS['zh-CN']['edit.fiveHourReserve']='5 小时基础保留比例（%）';
+TRANSLATIONS['zh-CN']['edit.weeklyReserve']='每周基础保留比例（%）';
+TRANSLATIONS['zh-CN']['edit.fiveHourSteps']='5 小时时间规则';
+TRANSLATIONS['zh-CN']['edit.weeklySteps']='每周时间规则';
+TRANSLATIONS['zh-CN']['edit.minutesBeforeReset']='重置前分钟数';
+TRANSLATIONS['zh-CN']['edit.reservePercent']='保留比例（%）';
+TRANSLATIONS['zh-CN']['edit.addRule']='添加规则';
+TRANSLATIONS['zh-CN']['edit.removeRule']='删除规则';
+TRANSLATIONS['zh-CN']['error.reserveInteger']='保留比例必须是 0 到 100 的整数；规则分钟数须在有效范围内且不可重复。';
+TRANSLATIONS['zh-CN']['reason.five_hour_reserved']='5 小时保留额度';
+TRANSLATIONS['zh-CN']['reason.weekly_reserved']='每周保留额度';
+TRANSLATIONS['zh-CN']['reason.reserve_quota_unknown']='已启用保留但额度未知';
+TRANSLATIONS.en['account.reserveNow']='Effective reserve now';
+TRANSLATIONS['zh-CN']['account.reserveNow']='当前有效保留比例';
 TRANSLATIONS['zh-CN']['log.retry.attempt_started']='重试链开始尝试';
 TRANSLATIONS['zh-CN']['log.retry.retry_scheduled']='上游失败可重试，已安排下一次尝试';
 TRANSLATIONS['zh-CN']['log.retry.aborted']='上游失败不可重试，已停止重试';
@@ -1685,6 +1777,12 @@ const UNAVAILABLE_REASON_LABELS={
   en:{auth_failure:'Authentication needs re-login',local_failure:'Local auth data needs attention',stale_quota:'Quota data is stale or pending refresh',circuit_open:'Circuit open',quota_probe_wait:'Quota probe wait',temporary_exhausted:'Temporarily exhausted',five_hour_exhausted:'5-hour quota exhausted',weekly_exhausted:'Weekly quota exhausted',monthly_exhausted:'Monthly quota exhausted',unknown_account:'Unknown account'},
   'zh-CN':{auth_failure:'认证异常',local_failure:'本地认证异常',stale_quota:'额度缓存过期',circuit_open:'熔断中',quota_probe_wait:'等待额度探测',temporary_exhausted:'临时额度耗尽',five_hour_exhausted:'5 小时额度耗尽',weekly_exhausted:'周额度耗尽',monthly_exhausted:'月额度耗尽',unknown_account:'未知账号'}
 };
+UNAVAILABLE_REASON_LABELS.en.five_hour_reserved='5-hour reserve';
+UNAVAILABLE_REASON_LABELS.en.weekly_reserved='Weekly reserve';
+UNAVAILABLE_REASON_LABELS.en.reserve_quota_unknown='Quota unknown while reserve is enabled';
+UNAVAILABLE_REASON_LABELS['zh-CN'].five_hour_reserved='5 小时保留额度';
+UNAVAILABLE_REASON_LABELS['zh-CN'].weekly_reserved='每周保留额度';
+UNAVAILABLE_REASON_LABELS['zh-CN'].reserve_quota_unknown='已启用保留但额度未知';
 function normalizeLocale(raw){return String(raw||'').toLowerCase().startsWith('zh')?'zh-CN':'en'}
 function storedLocale(){try{const locale=window.localStorage.getItem(LOCALE_STORAGE_KEY);return locale==='zh-CN'||locale==='en'?locale:''}catch(error){return''}}
 function parentLocale(){try{if(window.parent===window)return'';const language=String(window.parent.document.documentElement.lang||'').trim().toLowerCase();if(!language)return'';return language.startsWith('zh')?'zh-CN':'en'}catch(error){return''}}
@@ -1730,7 +1828,7 @@ function resetCreditSummary(account){const parts=[];if(account.reset_credits_ava
 function renderEmptyState(){const empty=STATUS.empty_state||{};const title=empty.title||'暂无账号数据';const message=empty.message||'等待额度刷新后，这里会显示账号卡片。';const box=node('div','empty','');box.append(node('strong','',title),node('div','',message));return box}
 function createPinButton(account){const pinned=Number(account.scheduler_priority)===999;const button=node('button','ghost pinAccount '+(pinned?'pinned':''),'');button.type='button';button.dataset.authId=account.auth_id||'';button.dataset.pinned=String(pinned);button.setAttribute('aria-pressed',String(pinned));const label=t(pinned?'actions.unpinAccount':'actions.pinAccount');button.setAttribute('aria-label',label);button.title=label;button.innerHTML='<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 3a1 1 0 0 1 .8 1.6l-1.35 1.8 2.15 2.15a1 1 0 0 1 0 1.41l-2.12 2.12a1 1 0 0 1-.7.3h-2.37l-2.2 2.2.71 3.54a1 1 0 0 1-1.69.9L5 14.8a1 1 0 0 1 .9-1.69l3.54.71 2.2-2.2V9.25a1 1 0 0 1 .3-.7l2.12-2.12L15.2 4.6A1 1 0 0 1 16 3Z"/></svg>';button.addEventListener('click',()=>togglePin(account.auth_id||'',pinned,button));return button}
 async function togglePin(authID,pinned,button){if(!authID)return;if(!hasManagementKey()){showNotice(t('error.managementKeyRequired'),true,'error.managementKeyRequired');return}if(button)button.disabled=true;const priority=pinned?0:999;const noticeKey=pinned?'notice.accountUnpinned':'notice.accountPinned';try{await requestManagement('/annotations/account',{method:'PATCH',body:{auth_id:authID,scheduler_priority:priority}});showNotice(t(noticeKey),false,noticeKey);await refreshStatus()}catch(error){showNotice(error.message||String(error),true);if(button)button.disabled=false}}
-function renderAccounts(accounts){const queue=document.querySelector('section.queue');if(!queue)return;queue.replaceChildren();const items=Array.isArray(accounts)?accounts:[];if(items.length===0){queue.append(renderEmptyState());return}for(const account of items){const card=node('article','card '+(STATUS.next_auth_id&&STATUS.next_auth_id===account.auth_id?'next':''));card.dataset.authId=account.auth_id||'';const top=node('div','cardTop');const identity=node('div','identity');const titleLine=node('div','titleLine');titleLine.append(node('span','title',account.alias||account.auth_id||''));if(account.group)titleLine.append(node('span','groupPill',account.group));identity.append(titleLine);const sub=node('div','sub');const code=document.createElement('code');code.textContent=account.auth_id||'';sub.append(code);identity.append(sub);if(account.tags&&account.tags.length){const tags=node('div','metaLine');for(const tag of account.tags)tags.append(node('span','chip',tag));identity.append(tags)}top.append(identity,node('span','rank','#'+(account.rank||'')));card.append(top);const badges=node('div','badges');if(STATUS.next_auth_id&&STATUS.next_auth_id===account.auth_id)badges.append(addBadge('下一优先','next'));badges.append(account.available?addBadge('可用','ok'):addBadge(labelUnavailableReason(account.unavailable_reason),'no'));badges.append(addBadge(account.family||'未知类型'),addBadge('CPA 优先级 '+(account.cpa_priority||0)),addBadge('插件优先级 '+(account.scheduler_priority||0)),addBadge('熔断：'+((account.circuit&&account.circuit.label)||'')));if(account.auth_failure)badges.append(addBadge('请重新登录','no'));if(account.refresh_due_reason)badges.append(addBadge(labelDueReason(account.refresh_due_reason)));card.append(badges);const quotaList=node('div','quotaList');if(account.five_hour&&!account.five_hour.missing)quotaList.append(addQuota(account.five_hour,'5 小时额度'));if(account.long_window)quotaList.append(addQuota(account.long_window,account.long_window.label||'长额度'));card.append(quotaList);const kv=node('div','kv');addKV(kv,'缓存时间',account.cache_age||'暂无');addKV(kv,'额度来源',quotaSourceLabel(account.quota_source));if(account.managed_disable)addKV(kv,'托管停用',managedDisableLabel(account.managed_disable));addKV(kv,'熔断计数','失败 '+((account.circuit&&account.circuit.failure_count)||0)+' / 成功 '+((account.circuit&&account.circuit.success_count)||0));addKV(kv,'主动重置',resetCreditSummary(account));if(account.status_note)addKV(kv,'调度状态',account.status_note);if(account.last_error)addKV(kv,'最后错误',account.last_error);if(account.next_retry_text)addKV(kv,'下次重试',account.next_retry_text);card.append(kv);if(account.notes||account.group_notes){const notes=node('div','noteBlock');if(account.notes)notes.append(node('div','',account.notes));if(account.group_notes)notes.append(node('div','',account.group_notes));card.append(notes)}const actions=node('div','cardActions');const refresh=node('button','ghost refreshOne','刷新额度');refresh.type='button';refresh.addEventListener('click',()=>refreshOneQuota(account.auth_id||''));const edit=node('button','secondary openEdit','编辑');edit.type='button';edit.addEventListener('click',()=>openEdit(account.auth_id||''));actions.append(createPinButton(account),refresh,edit);card.append(actions);queue.append(card)}formatLocalTimes()}
+function renderAccounts(accounts){const queue=document.querySelector('section.queue');if(!queue)return;queue.replaceChildren();const items=Array.isArray(accounts)?accounts:[];if(items.length===0){queue.append(renderEmptyState());return}for(const account of items){const card=node('article','card '+(STATUS.next_auth_id&&STATUS.next_auth_id===account.auth_id?'next':''));card.dataset.authId=account.auth_id||'';const top=node('div','cardTop');const identity=node('div','identity');const titleLine=node('div','titleLine');titleLine.append(node('span','title',account.alias||account.auth_id||''));if(account.group)titleLine.append(node('span','groupPill',account.group));identity.append(titleLine);const sub=node('div','sub');const code=document.createElement('code');code.textContent=account.auth_id||'';sub.append(code);identity.append(sub);if(account.tags&&account.tags.length){const tags=node('div','metaLine');for(const tag of account.tags)tags.append(node('span','chip',tag));identity.append(tags)}top.append(identity,node('span','rank','#'+(account.rank||'')));card.append(top);const badges=node('div','badges');if(STATUS.next_auth_id&&STATUS.next_auth_id===account.auth_id)badges.append(addBadge('下一优先','next'));badges.append(account.available?addBadge('可用','ok'):addBadge(labelUnavailableReason(account.unavailable_reason),'no'));badges.append(addBadge(account.family||'未知类型'),addBadge('CPA 优先级 '+(account.cpa_priority||0)),addBadge('插件优先级 '+(account.scheduler_priority||0)),addBadge('熔断：'+((account.circuit&&account.circuit.label)||'')));if(account.auth_failure)badges.append(addBadge('请重新登录','no'));if(account.refresh_due_reason)badges.append(addBadge(labelDueReason(account.refresh_due_reason)));card.append(badges);const quotaList=node('div','quotaList');if(account.five_hour&&!account.five_hour.missing)quotaList.append(addQuota(account.five_hour,'5 小时额度'));if(account.long_window)quotaList.append(addQuota(account.long_window,account.long_window.label||'长额度'));card.append(quotaList);const kv=node('div','kv');addKV(kv,'缓存时间',account.cache_age||'暂无');addKV(kv,'额度来源',quotaSourceLabel(account.quota_source));if(account.managed_disable)addKV(kv,'托管停用',managedDisableLabel(account.managed_disable));addKV(kv,'熔断计数','失败 '+((account.circuit&&account.circuit.failure_count)||0)+' / 成功 '+((account.circuit&&account.circuit.success_count)||0));addKV(kv,'主动重置',resetCreditSummary(account));if(account.status_note)addKV(kv,'调度状态',account.status_note);if(account.last_error)addKV(kv,'最后错误',account.last_error);if(account.next_retry_text)addKV(kv,'下次重试',account.next_retry_text);addKV(kv,t('account.reserveNow'),quotaReserveSummary(account));card.append(kv);if(account.notes||account.group_notes){const notes=node('div','noteBlock');if(account.notes)notes.append(node('div','',account.notes));if(account.group_notes)notes.append(node('div','',account.group_notes));card.append(notes)}const actions=node('div','cardActions');const refresh=node('button','ghost refreshOne','刷新额度');refresh.type='button';refresh.addEventListener('click',()=>refreshOneQuota(account.auth_id||''));const edit=node('button','secondary openEdit','编辑');edit.type='button';edit.addEventListener('click',()=>openEdit(account.auth_id||''));actions.append(createPinButton(account),refresh,edit);card.append(actions);queue.append(card)}formatLocalTimes()}
 
 async function readJSON(resp){const text=await resp.text();if(!text)return{};try{return JSON.parse(text)}catch{return{error:text}}}
 function authHeaders(){const input=document.getElementById('managementKey');const key=(input&&input.value||'').trim();if(!key)throw new Error(t('error.managementKeyRequired'));const name='Author'+'ization';const scheme='Bea'+'rer ';const headers={};headers[name]=key.toLowerCase().startsWith(scheme.toLowerCase())?key:scheme+key;return headers}
@@ -1739,9 +1837,16 @@ function fillSettings(){const s=STATUS.settings||{};document.getElementById('han
 async function saveSettings(){try{if(!statusLoaded){await loadStatus();return}await requestManagement('/settings',{method:'PUT',body:collectSettingsPayload()});settingsDirty=false;showNotice(t('notice.settingsSaved'),false,'notice.settingsSaved');await refreshStatus({management:true,fillSettings:true})}catch(error){showNotice(error.message||String(error),true)}}
 async function refreshQuota(){try{await requestManagement('/refresh',{method:'POST'});showNotice(t('notice.refreshRequested'),false,'notice.refreshRequested');await refreshStatus({management:true});pollStatus(3,1200)}catch(error){showNotice(error.message||String(error),true)}}
 function splitTags(text){return text.split(',').map((item)=>item.trim()).filter(Boolean)}
-function openEdit(authID){if(!hasManagementKey()){showNotice(t('error.managementKeyRequired'),true,'error.managementKeyRequired');return}const account=accountsByID.get(authID)||{};editingAuthID=authID;document.getElementById('editAuthID').textContent=authID;document.getElementById('editAlias').value=account.alias||'';document.getElementById('editSchedulerPriority').value=account.scheduler_priority||0;document.getElementById('editNotes').value=account.notes||'';document.getElementById('editGroupID').value=account.group_id||'';document.getElementById('editGroupName').value=account.group||'';document.getElementById('editGroupNotes').value=account.group_notes||'';document.getElementById('editTags').value=(account.tags||[]).join(', ');editDialog.showModal()}
+function openEdit(authID){if(!hasManagementKey()){showNotice(t('error.managementKeyRequired'),true,'error.managementKeyRequired');return}const account=accountsByID.get(authID)||{};editingAuthID=authID;document.getElementById('editAuthID').textContent=authID;document.getElementById('editAlias').value=account.alias||'';document.getElementById('editSchedulerPriority').value=account.scheduler_priority||0;document.getElementById('editNotes').value=account.notes||'';document.getElementById('editGroupID').value=account.group_id||'';document.getElementById('editGroupName').value=account.group||'';document.getElementById('editGroupNotes').value=account.group_notes||'';document.getElementById('editTags').value=(account.tags||[]).join(', ');document.getElementById('five_hourReservePercent').value=account.five_hour_reserve_percent||0;document.getElementById('weeklyReservePercent').value=account.weekly_reserve_percent||0;renderReserveRules('five_hour',account.five_hour_reserve_steps==null?[{minutes_before_reset:20,reserve_percent:3},{minutes_before_reset:10,reserve_percent:1}]:account.five_hour_reserve_steps);renderReserveRules('weekly',account.weekly_reserve_steps==null?[{minutes_before_reset:60,reserve_percent:10},{minutes_before_reset:30,reserve_percent:5},{minutes_before_reset:15,reserve_percent:3},{minutes_before_reset:5,reserve_percent:1}]:account.weekly_reserve_steps);showReserveEditorError('');editDialog.showModal()}
+function showReserveEditorError(message){const error=document.getElementById('editReserveError');error.textContent=message;error.hidden=!message}
+function reserveLabel(key){const label=document.createElement('span');label.dataset.i18n=key;label.textContent=t(key);return label}
+function reserveRuleRow(kind,step){const row=node('div','reserveRuleRow');row.style.display='grid';row.style.gridTemplateColumns='minmax(0,1fr) minmax(0,1fr) auto';row.style.gap='8px';const minuteField=node('label','field');minuteField.append(reserveLabel('edit.minutesBeforeReset'));const minutes=document.createElement('input');minutes.type='number';minutes.min='1';minutes.max=kind==='five_hour'?'300':'10080';minutes.step='1';minutes.value=step.minutes_before_reset;minutes.dataset.reserveMinutes='';minuteField.append(minutes);const percentField=node('label','field');percentField.append(reserveLabel('edit.reservePercent'));const percent=document.createElement('input');percent.type='number';percent.min='0';percent.max='100';percent.step='1';percent.value=step.reserve_percent;percent.dataset.reservePercent='';percentField.append(percent);const remove=node('button','ghost','');remove.type='button';remove.textContent='-';remove.dataset.i18nAria='edit.removeRule';remove.title=t('edit.removeRule');remove.style.alignSelf='end';remove.style.width='36px';remove.style.height='36px';remove.setAttribute('aria-label',t('edit.removeRule'));remove.addEventListener('click',()=>row.remove());row.append(minuteField,percentField,remove);return row}
+function renderReserveRules(kind,steps){const container=document.getElementById(kind+'ReserveRules');container.replaceChildren();for(const step of steps||[])container.append(reserveRuleRow(kind,step))}
+function collectReserveRules(kind){const seen=new Set();const maxMinutes=kind==='five_hour'?300:10080;return [...document.getElementById(kind+'ReserveRules').children].map(row=>{const minutes=row.querySelector('[data-reserve-minutes]').valueAsNumber;const percent=row.querySelector('[data-reserve-percent]').valueAsNumber;if(!Number.isSafeInteger(minutes)||minutes<1||minutes>maxMinutes||!Number.isSafeInteger(percent)||percent<0||percent>100||seen.has(minutes))throw new Error(t('error.reserveInteger'));seen.add(minutes);return{minutes_before_reset:minutes,reserve_percent:percent}})}
+function buildReserveEditor(){document.getElementById('addFiveHourReserveRule').addEventListener('click',()=>document.getElementById('five_hourReserveRules').append(reserveRuleRow('five_hour',{minutes_before_reset:1,reserve_percent:0})));document.getElementById('addWeeklyReserveRule').addEventListener('click',()=>document.getElementById('weeklyReserveRules').append(reserveRuleRow('weekly',{minutes_before_reset:1,reserve_percent:0})))}
+function quotaReserveSummary(account){const fiveHour=account.five_hour_effective_reserve_percent||0;const weekly=account.weekly_effective_reserve_percent||0;const weeklyText=account.family==='monthly'?(currentLocale==='en'?'not applicable':'不适用'):weekly+'%';return currentLocale==='en'?'5h '+fiveHour+'% (base '+(account.five_hour_reserve_percent||0)+'%), weekly '+weeklyText+' (base '+(account.weekly_reserve_percent||0)+'%)':'5 小时 '+fiveHour+'%（基础 '+(account.five_hour_reserve_percent||0)+'%），每周 '+weeklyText+'（基础 '+(account.weekly_reserve_percent||0)+'%）'}
 function fillGroupFromID(){const groupID=document.getElementById('editGroupID').value.trim();const group=groupsByID.get(groupID);if(!group)return;if(!document.getElementById('editGroupName').value.trim())document.getElementById('editGroupName').value=group.name||'';if(!document.getElementById('editGroupNotes').value.trim())document.getElementById('editGroupNotes').value=group.notes||''}
-async function saveAccountModal(){if(!editingAuthID)return;const groupID=document.getElementById('editGroupID').value.trim();const groupName=document.getElementById('editGroupName').value.trim();const groupNotes=document.getElementById('editGroupNotes').value.trim();const schedulerPriority=document.getElementById('editSchedulerPriority').valueAsNumber;if(!Number.isSafeInteger(schedulerPriority)){showNotice(t('error.schedulerPriorityInteger'),true,'error.schedulerPriorityInteger');return}try{await requestManagement('/annotations/account',{method:'PATCH',body:{auth_id:editingAuthID,alias:document.getElementById('editAlias').value,notes:document.getElementById('editNotes').value,tags:splitTags(document.getElementById('editTags').value),group_id:groupID,scheduler_priority:schedulerPriority}});const existingGroup=groupsByID.get(groupID)||{name:'',notes:''};if(groupID&&(groupName!==existingGroup.name||groupNotes!==existingGroup.notes)){await requestManagement('/annotations/group',{method:'PATCH',body:{id:groupID,name:groupName,notes:groupNotes}});groupsByID.set(groupID,{name:groupName,notes:groupNotes})}showNotice(t('notice.accountSaved'),false,'notice.accountSaved');editDialog.close();await refreshStatus()}catch(error){showNotice(error.message||String(error),true)}}
+async function saveAccountModal(){if(!editingAuthID)return;showReserveEditorError('');const groupID=document.getElementById('editGroupID').value.trim();const groupName=document.getElementById('editGroupName').value.trim();const groupNotes=document.getElementById('editGroupNotes').value.trim();const schedulerPriority=document.getElementById('editSchedulerPriority').valueAsNumber;const fiveHourReserve=document.getElementById('five_hourReservePercent').valueAsNumber;const weeklyReserve=document.getElementById('weeklyReservePercent').valueAsNumber;if(!Number.isSafeInteger(schedulerPriority)){showReserveEditorError(t('error.schedulerPriorityInteger'));return}if(!Number.isSafeInteger(fiveHourReserve)||fiveHourReserve<0||fiveHourReserve>100||!Number.isSafeInteger(weeklyReserve)||weeklyReserve<0||weeklyReserve>100){showReserveEditorError(t('error.reserveInteger'));return}let fiveHourSteps,weeklySteps;try{fiveHourSteps=collectReserveRules('five_hour');weeklySteps=collectReserveRules('weekly')}catch(error){showReserveEditorError(error.message||String(error));return}try{await requestManagement('/annotations/account',{method:'PATCH',body:{auth_id:editingAuthID,alias:document.getElementById('editAlias').value,notes:document.getElementById('editNotes').value,tags:splitTags(document.getElementById('editTags').value),group_id:groupID,scheduler_priority:schedulerPriority,five_hour_reserve_percent:fiveHourReserve,weekly_reserve_percent:weeklyReserve,five_hour_reserve_steps:fiveHourSteps,weekly_reserve_steps:weeklySteps}});const existingGroup=groupsByID.get(groupID)||{name:'',notes:''};if(groupID&&(groupName!==existingGroup.name||groupNotes!==existingGroup.notes)){await requestManagement('/annotations/group',{method:'PATCH',body:{id:groupID,name:groupName,notes:groupNotes}});groupsByID.set(groupID,{name:groupName,notes:groupNotes})}showNotice(t('notice.accountSaved'),false,'notice.accountSaved');editDialog.close();await refreshStatus()}catch(error){showReserveEditorError(error.message||String(error))}}
 async function refreshOneQuota(authID){if(!authID)return;try{await requestManagement('/refresh/account',{method:'POST',body:{auth_id:authID}});showNotice(t('notice.refreshOneRequested'),false,'notice.refreshOneRequested');await refreshStatus();pollStatus(3,1200)}catch(error){showNotice(error.message||String(error),true)}}
 async function exportConfig(){try{const data=await requestManagement('/export');const blob=new Blob([JSON.stringify(data,null,2)+'\n'],{type:'application/json'});const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='codex-quota-scheduler-config.json';link.click();URL.revokeObjectURL(link.href);showNotice(t('notice.configExported'),false,'notice.configExported');await refreshLogs()}catch(error){showNotice(error.message||String(error),true)}}
 async function exportLogs(){try{await refreshStatus({management:true});const payload={plugin_id:STATUS.plugin_id||'codex-quota-scheduler',exported_at:new Date().toISOString(),logs:STATUS.logs||[]};const blob=new Blob([JSON.stringify(payload,null,2)+'\n'],{type:'application/json'});const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='codex-quota-scheduler-logs.json';link.click();URL.revokeObjectURL(link.href);showNotice(t('notice.logsExported'),false,'notice.logsExported')}catch(error){showNotice(error.message||String(error),true)}}
@@ -1791,6 +1896,7 @@ rebuildDerivedState();
 fillSettings();
 renderMetrics();
 renderRosterLifecycle();
+buildReserveEditor();
 renderAccounts(STATUS.accounts||[]);
 formatLocalTimes();
 applyLocale();

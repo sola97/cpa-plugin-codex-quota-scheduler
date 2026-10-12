@@ -143,6 +143,9 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		}
 	}
 	decision := schedulerPickPublished(req, time.Now())
+	if decision.Reject {
+		return errorEnvelope("quota_reserve_protected", "No selectable Codex account; quota reserves prevent built-in fallback"), nil
+	}
 	return okEnvelope(pluginapi.SchedulerPickResponse{
 		AuthID:          decision.AuthID,
 		DelegateBuiltin: decision.DelegateBuiltin,
@@ -177,6 +180,11 @@ func logSchedulerDecision(store *PluginState, req pluginapi.SchedulerPickRequest
 			fields["selected_cpa_priority"] = selected.CPAPriority
 			fields["selected_scheduler_priority"] = selected.SchedulerPriority
 		}
+	} else if decision.Reject {
+		level = "warn"
+		event = "scheduler.reserve_protected"
+		message = "Quota reserves prevented selection and built-in fallback"
+		fields["unavailable_summary"] = decision.UnavailableSummary
 	} else if decision.DelegateBuiltin != "" {
 		event = "scheduler.fallback"
 		message = "插件触发内置调度 fallback"
