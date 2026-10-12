@@ -198,6 +198,9 @@ func accountExclusionReason(a AccountView, now time.Time) string {
 }
 
 func observeSchedulerDecision(snapshot *SchedulerSnapshot, req pluginapi.SchedulerPickRequest, decision PickDecision, now time.Time) PickDecision {
+	if snapshot != nil {
+		decision.QuotaReserveDetails = schedulerReserveDetails(*snapshot, req, now)
+	}
 	if snapshot != nil && snapshot.Observation != nil {
 		snapshot.Observation(req, decision, now)
 	}

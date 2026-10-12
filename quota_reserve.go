@@ -38,7 +38,7 @@ func validateQuotaReserves(accounts map[string]AccountAnnotation) error {
 }
 
 func hasQuotaReserve(annotation AccountAnnotation) bool {
-	return annotation.FiveHourReservePercent > 0 || annotation.WeeklyReservePercent > 0
+	return annotation.QuotaReserveEnabled && (annotation.FiveHourReservePercent > 0 || annotation.WeeklyReservePercent > 0)
 }
 
 type QuotaReservation struct {

@@ -749,7 +749,7 @@ func (r *QuotaRefresher) reconcileActiveCredentialTails(ctx context.Context, bin
 			if suspended && !errors.Is(err, ErrCredentialRollbackFailed) {
 				r.coordinator.restoreCancelledInstances(oldGenerations, cancellationTokens)
 			}
-			r.state.RecordLog("warn", "credential.reconcile_failed", "credential reconciliation will retry on a later authoritative roster sync", map[string]any{"auth_id": authID}, r.now())
+			r.state.RecordLog("warn", "credential.reconcile_failed", "凭据核对失败，将在下一次权威账号列表同步时重试", map[string]any{"auth_id": authID}, r.now())
 			continue
 		}
 		if err != nil {

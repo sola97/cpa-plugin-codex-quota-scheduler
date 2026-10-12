@@ -95,7 +95,7 @@ func TestAccountAnnotationPatchResolvesInstanceIdentityFromAuthID(t *testing.T) 
 	if decision := schedulerPickPublished(request, now); decision.AuthID != "acct" {
 		t.Fatalf("account was not selectable before reserve update: %#v", decision)
 	}
-	resp := quotaReserveManagementRequest(t, store, http.MethodPatch, "/annotations/account", `{"auth_id":"acct","alias":"saved","five_hour_reserve_percent":10}`, now)
+	resp := quotaReserveManagementRequest(t, store, http.MethodPatch, "/annotations/account", `{"auth_id":"acct","alias":"saved","quota_reserve_enabled":true,"five_hour_reserve_percent":10}`, now)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("PATCH account status=%d body=%s", resp.StatusCode, resp.Body)
 	}
@@ -158,6 +158,7 @@ func TestQuotaReserveStatusReportsConfiguredAndEffectiveValues(t *testing.T) {
 		Family:        AccountFamilyWeekly,
 		LastSuccessAt: now,
 		Annotation: AccountAnnotation{
+			QuotaReserveEnabled:    true,
 			FiveHourReservePercent: 9,
 			WeeklyReservePercent:   12,
 			FiveHourReserveSteps:   []QuotaReserveStep{{MinutesBeforeReset: 15, ReservePercent: 4}},

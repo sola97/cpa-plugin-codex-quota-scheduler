@@ -144,7 +144,7 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	}
 	decision := schedulerPickPublished(req, time.Now())
 	if decision.Reject {
-		return errorEnvelope("quota_reserve_protected", "No selectable Codex account; quota reserves prevent built-in fallback"), nil
+		return errorEnvelope("quota_reserve_protected", "没有可选的 Codex 账号；额度保留保护已阻止内置调度回退"), nil
 	}
 	return okEnvelope(pluginapi.SchedulerPickResponse{
 		AuthID:          decision.AuthID,
@@ -169,10 +169,15 @@ func logSchedulerDecision(store *PluginState, req pluginapi.SchedulerPickRequest
 		"provider":      req.Provider,
 		"reason":        decision.Reason,
 		"ordered_count": len(decision.Ordered),
+		"reason_text":   schedulerReasonText(decision.Reason),
+	}
+	if len(decision.QuotaReserveDetails) > 0 {
+		fields["quota_reserve_details"] = decision.QuotaReserveDetails
 	}
 	if decision.AuthID != "" {
 		event = "scheduler.selected"
-		message = "请求已由插件接管"
+		message = "已选择账号：" + decision.AuthID
+		fields["reason_text"] = "该账号符合当前调度条件；按可用状态、优先级及额度窗口顺序选择"
 		fields["auth_id"] = decision.AuthID
 		if selected, ok := findScheduledAccount(decision.Ordered, decision.AuthID); ok {
 			fields["selected_queue_status"] = string(selected.QueueStatus)
@@ -183,11 +188,11 @@ func logSchedulerDecision(store *PluginState, req pluginapi.SchedulerPickRequest
 	} else if decision.Reject {
 		level = "warn"
 		event = "scheduler.reserve_protected"
-		message = "Quota reserves prevented selection and built-in fallback"
+		message = "额度保留保护已生效：没有可选账号，禁止回退到内置调度"
 		fields["unavailable_summary"] = decision.UnavailableSummary
 	} else if decision.DelegateBuiltin != "" {
 		event = "scheduler.fallback"
-		message = "插件触发内置调度 fallback"
+		message = "没有符合插件调度条件的账号，回退到内置调度"
 		fields["fallback"] = decision.DelegateBuiltin
 		summary := decision.UnavailableSummary
 		if summary == "" {

@@ -8,12 +8,13 @@ import (
 )
 
 type PickDecision struct {
-	AuthID          string
-	Handled         bool
-	Reject          bool
-	DelegateBuiltin string
-	Reason          string
-	Ordered         []ScheduledAccount
+	QuotaReserveDetails []string
+	AuthID              string
+	Handled             bool
+	Reject              bool
+	DelegateBuiltin     string
+	Reason              string
+	Ordered             []ScheduledAccount
 	// UnavailableSummary explains a fallback decision from the published
 	// snapshot when the Ordered list is not populated (the pick path never
 	// builds it), e.g. "auth_failure=2,temporary_exhausted=1".

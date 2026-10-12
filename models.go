@@ -112,6 +112,7 @@ type AccountAnnotation struct {
 	Tags                   []string           `json:"tags,omitempty" yaml:"tags,omitempty"`
 	GroupID                string             `json:"group_id,omitempty" yaml:"group_id,omitempty"`
 	SchedulerPriority      int                `json:"scheduler_priority,omitempty" yaml:"scheduler_priority,omitempty"`
+	QuotaReserveEnabled    bool               `json:"quota_reserve_enabled" yaml:"quota_reserve_enabled"`
 	FiveHourReservePercent int                `json:"five_hour_reserve_percent,omitempty" yaml:"five_hour_reserve_percent,omitempty"`
 	WeeklyReservePercent   int                `json:"weekly_reserve_percent,omitempty" yaml:"weekly_reserve_percent,omitempty"`
 	FiveHourReserveSteps   []QuotaReserveStep `json:"five_hour_reserve_steps" yaml:"five_hour_reserve_steps"`

@@ -10,7 +10,10 @@ order alone.
 ## Per-Account Quota Reserves (sola97 Fork)
 
 Open an account's **Edit** dialog to set separate **5-hour reserve (%)** and
-**Weekly reserve (%)** values. Set both to `10` to stop assigning new requests
+**Weekly reserve (%)** values and explicitly turn on that account's independent
+**Quota Reserve Protection** switch. The switch defaults to off; saving ratios
+does not enable protection. Turning it off preserves the rules without enforcing
+them and does not affect other accounts. Set both to `10` to stop assigning new requests
 when either window has 10% or less remaining. Legacy accounts default to `0`
 (disabled); enabling this fork does not silently change existing accounts.
 
@@ -43,6 +46,7 @@ example, PATCH `/v0/management/plugins/codex-quota-scheduler/annotations/account
 ```json
 {
   "auth_id": "your-codex-auth-id",
+  "quota_reserve_enabled": true,
   "five_hour_reserve_percent": 10,
   "weekly_reserve_percent": 10,
   "five_hour_reserve_steps": [
@@ -61,6 +65,12 @@ example, PATCH `/v0/management/plugins/codex-quota-scheduler/annotations/account
 PATCH preserves omitted settings; explicit empty step arrays disable time
 rows, while missing or `null` stored arrays use the defaults. Account edits
 take effect in the published scheduler before the save response returns.
+
+The account card distinguishes a disabled protection switch from active reserve
+percentages. Scheduler logs explain decisions in Chinese, including each account's
+switch, matched time rule, remaining quota and effective threshold comparison.
+Machine reason codes remain available for export. Diagnostics use the actual
+pick-time snapshot, not potentially newer settings when asynchronous logging runs.
 
 Keep plugin scheduling enabled. Protected accounts are excluded, and other
 eligible accounts can still be selected, including lower CPA priorities when

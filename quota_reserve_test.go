@@ -18,7 +18,7 @@ func reserveTestAccount(now time.Time, fiveHourUsed, weeklyUsed float64) Account
 			FiveHour:   &QuotaWindow{Kind: WindowFiveHour, UsedPercent: &fiveHourUsed, ResetAt: now.Add(2 * time.Hour)},
 			LongWindow: &QuotaWindow{Kind: WindowWeekly, UsedPercent: &weeklyUsed, ResetAt: now.Add(24 * time.Hour)},
 		},
-		Annotation: AccountAnnotation{FiveHourReservePercent: 10, WeeklyReservePercent: 10},
+		Annotation: AccountAnnotation{QuotaReserveEnabled: true, FiveHourReservePercent: 10, WeeklyReservePercent: 10},
 	}
 }
 
