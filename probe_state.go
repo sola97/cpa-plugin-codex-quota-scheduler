@@ -42,11 +42,12 @@ const (
 )
 
 type ProbeEvent struct {
-	Kind        ProbeEventKind
-	Window      ProbeWindowKind
-	Now         time.Time
-	Snapshots   map[ProbeWindowKind]QuotaSnapshot
-	RefreshMode RefreshMode
+	Kind                ProbeEventKind
+	Window              ProbeWindowKind
+	Now                 time.Time
+	Snapshots           map[ProbeWindowKind]QuotaSnapshot
+	RefreshMode         RefreshMode
+	ObservationInterval time.Duration
 }
 type ProbeController struct {
 	mu      sync.Mutex
@@ -115,6 +116,19 @@ func (c *ProbeController) SetWindow(i AuthInstanceID, k ProbeWindowKind, w Probe
 	}
 	c.windows[i][k] = w
 }
+func (c *ProbeController) ReplaceInstance(i AuthInstanceID, windows map[ProbeWindowKind]ProbeWindow) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(windows) == 0 {
+		delete(c.windows, i)
+		return
+	}
+	next := make(map[ProbeWindowKind]ProbeWindow, len(windows))
+	for kind, window := range windows {
+		next[kind] = window
+	}
+	c.windows[i] = next
+}
 func (c *ProbeController) Window(i AuthInstanceID, k ProbeWindowKind) (ProbeWindow, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -161,15 +175,56 @@ func (c *ProbeController) Advance(i AuthInstanceID, e ProbeEvent) []Intent {
 			if !ok {
 				continue
 			}
-			cl := ClassifyProbeWindow(w.Baseline, snap, e.Now)
+			baseline := w.Baseline
+			shiftedZeroCandidate := false
+			strictAuthorized := false
+			if e.Kind == ProbeEventPrecheckResult && baseline.Kind == ProbeBaselineReset && snap.Valid && snap.ResetAt != nil && snap.Usage != nil {
+				migrated := baseline.SuspectedLazy
+				shifted := snap.ResetAt.After(baseline.ResetAt.Add(probeSkewTolerance))
+				shiftedZeroCandidate = shifted && *snap.Usage == 0
+				if baseline.WindowKind == "" && compatibleLegacyProbeWindowKind(k, baseline, snap) {
+					baseline.WindowKind = snap.WindowKind
+				}
+				kindMatches := baseline.WindowKind != "" && snap.WindowKind == baseline.WindowKind
+				strictWindow := QuotaWindow{Kind: snap.WindowKind, UsedPercent: snap.Usage, ResetAt: *snap.ResetAt}
+				if (shifted || migrated) && kindMatches && snap.WindowLengthKnown && looksLikeStrictLazyObservation(e.Now, strictWindow, snap.WindowLength) {
+					baseline.ResetAt = *snap.ResetAt
+					baseline.Usage = *snap.Usage
+					baseline.SuspectedLazy = true
+					strictAuthorized = true
+				}
+			}
+			if e.Kind == ProbeEventVerifyResult && externalResetRebaseApplies(baseline, snap, e.Now) {
+				// A server-side compensating reset minted a fresh never-used
+				// window while our probe was in flight. Rebase the baseline to
+				// the new window instead of classifying the multi-cycle jump as
+				// an anomaly, so the window retries activation on the next
+				// precheck instead of looping in AnomalyHold (Siriussee
+				// fix/prewarm-unused-lazy-windows, adapted to the strict
+				// evidence model: the fresh-window signature below is required).
+				baseline.ResetAt = *snap.ResetAt
+				baseline.Usage = *snap.Usage
+				baseline.SuspectedLazy = true
+			}
+			cl := ClassifyProbeWindow(baseline, snap, e.Now)
 			w.Baseline = cl.Baseline
+			unauthorizedLazy := e.Kind == ProbeEventPrecheckResult && (cl.Kind == ProbeStillLazy || cl.Kind == ProbeAmbiguous) && !strictAuthorized
+			unauthorizedShiftedZero := e.Kind == ProbeEventPrecheckResult && shiftedZeroCandidate && !strictAuthorized && cl.Kind == ProbeActivatedNew
+			if unauthorizedLazy || unauthorizedShiftedZero {
+				w.Baseline.SuspectedLazy = false
+				w.State = ProbeWaitingReset
+				w.AttemptID = ""
+				w.Deadline = readOnlyObservationDeadline(w.Baseline, e.Now, e.ObservationInterval)
+				ws[k] = w
+				continue
+			}
 			switch cl.Kind {
 			case ProbeActivatedNew, ProbeActivatedInferred:
 				w.State = ProbeConfirmed
 				w.Deadline = time.Time{}
 			case ProbeNotDueYet:
 				w.State = ProbeWaitingReset
-				w.Deadline = deadlineFor(w.Baseline, e.Now)
+				w.Deadline = deadlineFor(w.Baseline, e.Now, e.ObservationInterval)
 			case ProbeAnomaly:
 				w.State = ProbeAnomalyHold
 				w.Deadline = e.Now.Add(probeUnknownResetRecheck)
@@ -202,22 +257,60 @@ func (c *ProbeController) Advance(i AuthInstanceID, e ProbeEvent) []Intent {
 			}
 		case ProbeEventRosterConfirmed:
 			if w.State == ProbeWaitingRoster {
-				w.State = ProbeWaitingReset
-				w.Deadline = deadlineFor(w.Baseline, e.Now)
+				if w.Baseline.SuspectedLazy {
+					w.State = ProbePendingCheck
+					w.Deadline = time.Time{}
+				} else {
+					w.State = ProbeWaitingReset
+					w.Deadline = deadlineFor(w.Baseline, e.Now, e.ObservationInterval)
+				}
 				ws[k] = w
 			}
 		}
 	}
 	return out
 }
-func deadlineFor(b ProbeBaseline, now time.Time) time.Time {
+
+func compatibleLegacyProbeWindowKind(slot ProbeWindowKind, baseline ProbeBaseline, snap QuotaSnapshot) bool {
+	if baseline.WindowLength <= 0 || snap.WindowKind == "" || !snap.WindowLengthKnown || snap.WindowLength <= 0 || absDuration(snap.WindowLength-baseline.WindowLength) > probeSkewTolerance {
+		return false
+	}
+	switch slot {
+	case ProbeWindowFiveHour:
+		return snap.WindowKind == WindowFiveHour
+	case ProbeWindowLong:
+		return snap.WindowKind == WindowWeekly || snap.WindowKind == WindowMonthly
+	default:
+		return false
+	}
+}
+
+func deadlineFor(b ProbeBaseline, now time.Time, observationInterval time.Duration) time.Time {
 	if b.Kind == ProbeBaselineUsageOnly {
 		return b.NextRecheckAt
 	}
 	if b.ResetAt.IsZero() {
 		return now
 	}
-	return b.ResetAt.Add(probeRefreshAfterResetDelay)
+	resetMaturity := b.ResetAt.Add(probeRefreshAfterResetDelay)
+	if b.WindowLength <= 0 || observationInterval <= 0 {
+		return resetMaturity
+	}
+	observation := now.Add(observationInterval)
+	if observation.Before(resetMaturity) {
+		return observation
+	}
+	return resetMaturity
+}
+func readOnlyObservationDeadline(b ProbeBaseline, now time.Time, observationInterval time.Duration) time.Time {
+	deadline := deadlineFor(b, now, observationInterval)
+	if deadline.After(now) {
+		return deadline
+	}
+	if observationInterval <= 0 {
+		observationInterval = probeUnknownResetRecheck
+	}
+	return now.Add(observationInterval)
 }
 func probeBackoff(n int) time.Duration {
 	if n <= 1 {
@@ -227,4 +320,40 @@ func probeBackoff(n int) time.Duration {
 		return 5 * time.Minute
 	}
 	return 15 * time.Minute
+}
+
+// externalResetRebaseApplies reports whether a verify snapshot proves that a
+// server-side compensating reset replaced the observed window mid-probe: the
+// reset jumped forward beyond a full extra window cycle, the snapshot is a
+// fresh never-used window (zero usage, known length, reset one window-length
+// after the observation), and the window kind matches the baseline. Garbage
+// far-future timestamps, backwards jumps, and used windows all fail the
+// signature and keep the conservative anomaly classification.
+func externalResetRebaseApplies(baseline ProbeBaseline, snap QuotaSnapshot, now time.Time) bool {
+	if baseline.Kind != ProbeBaselineReset || !snap.Valid || snap.ResetAt == nil || snap.Usage == nil || *snap.Usage != 0 {
+		return false
+	}
+	forward := snap.ResetAt.After(baseline.ResetAt.Add(probeSkewTolerance))
+	if !forward {
+		return false
+	}
+	delta := snap.ResetAt.Sub(baseline.ResetAt)
+	if baseline.WindowLength > 0 && delta <= 2*baseline.WindowLength {
+		return false
+	}
+	if baseline.WindowLength == 0 && delta <= probeMaxPlausibleWindow {
+		return false
+	}
+	if baseline.WindowKind != "" && snap.WindowKind != baseline.WindowKind {
+		return false
+	}
+	length := baseline.WindowLength
+	if snap.WindowLengthKnown && snap.WindowLength > 0 {
+		length = snap.WindowLength
+	}
+	if length <= 0 {
+		return false
+	}
+	strictWindow := QuotaWindow{Kind: snap.WindowKind, UsedPercent: snap.Usage, ResetAt: *snap.ResetAt}
+	return looksLikeStrictLazyObservation(now, strictWindow, length)
 }

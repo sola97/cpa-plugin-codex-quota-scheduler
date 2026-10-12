@@ -730,7 +730,7 @@ func TestClosedCircuitProbeFailureControlsRefreshDue(t *testing.T) {
 	}
 }
 
-func TestRecordRefreshAuthFailureStopsRetry(t *testing.T) {
+func TestRecordRefreshAuthFailureSchedulesBackoffRetry(t *testing.T) {
 	now := time.Date(2026, 6, 27, 10, 0, 0, 0, time.UTC)
 	store := NewPluginState(DefaultConfig())
 	store.UpsertQuota(AccountState{AuthID: "auth-1", AuthIndex: "idx-1", Provider: "codex"})
@@ -741,8 +741,18 @@ func TestRecordRefreshAuthFailureStopsRetry(t *testing.T) {
 	if !updated.Refresh.AuthFailure {
 		t.Fatal("AuthFailure = false, want true")
 	}
-	if !updated.Refresh.NextRetryAt.IsZero() {
-		t.Fatalf("NextRetryAt = %s, want zero", updated.Refresh.NextRetryAt)
+	// Auth failure parks scheduling but retries at the low-frequency backoff
+	// so an operator re-login recovers without a manual refresh.
+	want := now.Add(DefaultConfig().AuthFailureRetryInterval)
+	if !updated.Refresh.NextRetryAt.Equal(want) {
+		t.Fatalf("NextRetryAt = %s, want %s", updated.Refresh.NextRetryAt, want)
+	}
+	if due := store.DueAccounts(now); len(due) != 0 {
+		t.Fatalf("due accounts before backoff = %#v, want none", due)
+	}
+	due := store.DueAccounts(want)
+	if len(due) != 1 || due[0].AuthID != "auth-1" {
+		t.Fatalf("due accounts at backoff deadline = %#v, want auth-1", due)
 	}
 }
 
@@ -777,10 +787,57 @@ func TestAccountRefreshDueReasons(t *testing.T) {
 	if due, reason := accountRefreshDue(retry, cfg, now); !due || reason != "retry_due" {
 		t.Fatalf("retry due=%v reason=%q, want true retry_due", due, reason)
 	}
-	authFailed := AccountState{AuthID: "a", LastSuccessAt: now.Add(-6 * time.Hour)}
-	authFailed.Refresh.AuthFailure = true
-	if due, reason := accountRefreshDue(authFailed, cfg, now); due || reason != "auth_failure" {
-		t.Fatalf("auth failure due=%v reason=%q, want false auth_failure", due, reason)
+	authWait := AccountState{AuthID: "a", LastSuccessAt: now.Add(-time.Hour)}
+	authWait.Refresh.AuthFailure = true
+	authWait.Refresh.NextRetryAt = now.Add(15 * time.Minute)
+	if due, reason := accountRefreshDue(authWait, cfg, now); due || reason != "retry_wait" {
+		t.Fatalf("auth failure before backoff due=%v reason=%q, want false retry_wait", due, reason)
+	}
+	authDue := authWait
+	authDue.Refresh.NextRetryAt = now.Add(-time.Second)
+	if due, reason := accountRefreshDue(authDue, cfg, now); !due || reason != "retry_due" {
+		t.Fatalf("auth failure after backoff due=%v reason=%q, want true retry_due", due, reason)
+	}
+}
+
+func TestClearAccountAuthFailure(t *testing.T) {
+	now := time.Date(2026, 6, 27, 10, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	store.UpsertQuota(AccountState{AuthID: "auth-1", AuthIndex: "idx-1", Provider: "codex", LastSuccessAt: now.Add(-2 * time.Hour)})
+	if store.ClearAccountAuthFailure("auth-1") {
+		t.Fatal("ClearAccountAuthFailure = true without auth failure, want false")
+	}
+	store.RecordRefreshFailure("auth-1", "idx-1", RefreshFailureAuth, "please re-login", now)
+	if due := store.DueAccounts(now); len(due) != 0 {
+		t.Fatalf("due accounts while parked = %#v, want none", due)
+	}
+	if !store.ClearAccountAuthFailure("auth-1") {
+		t.Fatal("ClearAccountAuthFailure = false with auth failure, want true")
+	}
+	if store.ClearAccountAuthFailure("auth-1") {
+		t.Fatal("ClearAccountAuthFailure = true on second call, want false")
+	}
+	account := store.Snapshot(now).Accounts[0]
+	if account.Refresh.AuthFailure {
+		t.Fatal("AuthFailure still true after clear")
+	}
+	if !account.Refresh.NextRetryAt.IsZero() {
+		t.Fatalf("NextRetryAt = %s, want zero after clear", account.Refresh.NextRetryAt)
+	}
+	if due := store.DueAccounts(now); len(due) != 1 || due[0].AuthID != "auth-1" {
+		t.Fatalf("due accounts after clear = %#v, want auth-1", due)
+	}
+}
+
+func TestNextRefreshDueAtIncludesAuthFailureRetry(t *testing.T) {
+	now := time.Date(2026, 6, 27, 10, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	store.RecordCodexActivity(now)
+	store.UpsertQuota(AccountState{AuthID: "auth-1", AuthIndex: "idx-1", Provider: "codex", LastSuccessAt: now})
+	store.RecordRefreshFailure("auth-1", "idx-1", RefreshFailureAuth, "please re-login", now)
+	want := now.Add(DefaultConfig().AuthFailureRetryInterval)
+	if got := store.NextRefreshDueAt(now); !got.Equal(want) {
+		t.Fatalf("NextRefreshDueAt = %s, want %s", got, want)
 	}
 }
 
@@ -843,5 +900,126 @@ func TestResetProbeUsageEvidence(t *testing.T) {
 	}
 	if resetProbeUsageEvidence([]byte(`{"id":"probe","usage":{}}`)) {
 		t.Fatal("empty usage was accepted")
+	}
+}
+
+func TestRecordAccountSuccessClearsTemporaryExhausted(t *testing.T) {
+	now := time.Date(2026, 9, 19, 9, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	store.UpsertQuota(AccountState{AuthID: "team", AuthIndex: "idx-team", Provider: "codex", LastSuccessAt: now})
+	store.MarkAccountTemporaryExhausted("team", now.Add(3*time.Hour), usageLimitReachedReason)
+	if account := accountByAuthID(t, store.Snapshot(now), "team"); !account.TemporaryExhausted {
+		t.Fatal("precondition: TemporaryExhausted should be set")
+	}
+	account, ok := store.RecordAccountSuccess("team", "idx-team", now)
+	if !ok {
+		t.Fatal("RecordAccountSuccess reported no account")
+	}
+	if account.TemporaryExhausted || !account.TemporaryResetAt.IsZero() {
+		t.Fatalf("temporary exhaustion survived a real request success: %#v", account)
+	}
+}
+
+func TestQuotaRefreshAutoClearsTemporaryExhaustionOnWindowIdentityChange(t *testing.T) {
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	version := store.ReplaceCPAAdmission(CPAAdmissionState{Observed: true, Priority: 1, AuthIDs: map[string]struct{}{"auth-1": {}}})
+	store.UpsertQuota(AccountState{AuthID: "auth-1", AuthIndex: "idx-1", Provider: "codex", LastSuccessAt: now.Add(-time.Hour)})
+	store.MarkAccountTemporaryExhausted("auth-1", now.Add(3*time.Hour), usageLimitReachedReason)
+
+	// Upstream reset minted a new five-hour window (reset moved from 15:00 to
+	// 17:00) with remaining capacity in both windows.
+	fresh := accountByAuthID(t, store.Snapshot(now), "auth-1")
+	fresh.Quota = ParsedQuota{
+		Family:     AccountFamilyWeekly,
+		FiveHour:   &QuotaWindow{Kind: WindowFiveHour, UsedPercent: float64Ptr(0), ResetAt: now.Add(5 * time.Hour)},
+		LongWindow: &QuotaWindow{Kind: WindowWeekly, UsedPercent: float64Ptr(10), ResetAt: now.Add(72 * time.Hour)},
+	}
+	fresh.Family = AccountFamilyWeekly
+	fresh.LastSuccessAt = now
+	if !store.ApplyQuotaRefreshSuccessIfAdmissionCurrent(fresh, version, now) {
+		t.Fatal("fresh quota refresh was rejected")
+	}
+	account := accountByAuthID(t, store.Snapshot(now), "auth-1")
+	if account.TemporaryExhausted {
+		t.Fatalf("temporary exhaustion survived a confirmed window-identity change: %#v", account)
+	}
+	status, available, reason, _ := accountQueueState(account, now)
+	if status != QueueStatusAvailable || !available || reason != "" {
+		t.Fatalf("queue = status=%s available=%t reason=%q, want available", status, available, reason)
+	}
+}
+
+func TestQuotaRefreshKeepsTemporaryExhaustionOnSameWindowFullReading(t *testing.T) {
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	version := store.ReplaceCPAAdmission(CPAAdmissionState{Observed: true, Priority: 1, AuthIDs: map[string]struct{}{"auth-1": {}}})
+	store.UpsertQuota(AccountState{AuthID: "auth-1", AuthIndex: "idx-1", Provider: "codex", LastSuccessAt: now.Add(-time.Hour)})
+	markReset := now.Add(3 * time.Hour)
+	store.MarkAccountTemporaryExhausted("auth-1", markReset, usageLimitReachedReason)
+
+	// K12-style misreport: the quota endpoint shows a full five-hour window,
+	// but it is the SAME window the 429 pointed at — no reset happened.
+	fresh := accountByAuthID(t, store.Snapshot(now), "auth-1")
+	fresh.Quota = ParsedQuota{
+		Family:     AccountFamilyWeekly,
+		FiveHour:   &QuotaWindow{Kind: WindowFiveHour, UsedPercent: float64Ptr(0), ResetAt: markReset},
+		LongWindow: &QuotaWindow{Kind: WindowWeekly, UsedPercent: float64Ptr(10), ResetAt: now.Add(72 * time.Hour)},
+	}
+	fresh.Family = AccountFamilyWeekly
+	fresh.LastSuccessAt = now
+	if !store.ApplyQuotaRefreshSuccessIfAdmissionCurrent(fresh, version, now) {
+		t.Fatal("fresh quota refresh was rejected")
+	}
+	account := accountByAuthID(t, store.Snapshot(now), "auth-1")
+	if !account.TemporaryExhausted {
+		t.Fatal("same-window full reading incorrectly cleared the temporary-exhaustion marker")
+	}
+}
+
+func TestQuotaRefreshKeepsTemporaryExhaustionWhenWindowStillLimited(t *testing.T) {
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	version := store.ReplaceCPAAdmission(CPAAdmissionState{Observed: true, Priority: 1, AuthIDs: map[string]struct{}{"auth-1": {}}})
+	store.UpsertQuota(AccountState{AuthID: "auth-1", AuthIndex: "idx-1", Provider: "codex", LastSuccessAt: now.Add(-time.Hour)})
+	store.MarkAccountTemporaryExhausted("auth-1", now.Add(3*time.Hour), usageLimitReachedReason)
+
+	fresh := accountByAuthID(t, store.Snapshot(now), "auth-1")
+	fresh.Quota = ParsedQuota{
+		Family:     AccountFamilyWeekly,
+		FiveHour:   &QuotaWindow{Kind: WindowFiveHour, UsedPercent: float64Ptr(100), Exhausted: true, ResetAt: now.Add(5 * time.Hour)},
+		LongWindow: &QuotaWindow{Kind: WindowWeekly, UsedPercent: float64Ptr(10), ResetAt: now.Add(72 * time.Hour)},
+	}
+	fresh.Family = AccountFamilyWeekly
+	fresh.LastSuccessAt = now
+	if !store.ApplyQuotaRefreshSuccessIfAdmissionCurrent(fresh, version, now) {
+		t.Fatal("fresh quota refresh was rejected")
+	}
+	account := accountByAuthID(t, store.Snapshot(now), "auth-1")
+	if !account.TemporaryExhausted {
+		t.Fatal("exhausted fresh window incorrectly cleared the temporary-exhaustion marker")
+	}
+}
+
+func TestQuotaRefreshAutoClearsViaLongWindowWhenFiveHourAbsent(t *testing.T) {
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	version := store.ReplaceCPAAdmission(CPAAdmissionState{Observed: true, Priority: 1, AuthIDs: map[string]struct{}{"auth-1": {}}})
+	store.UpsertQuota(AccountState{AuthID: "auth-1", AuthIndex: "idx-1", Provider: "codex", LastSuccessAt: now.Add(-time.Hour)})
+	store.MarkAccountTemporaryExhausted("auth-1", now.Add(3*time.Hour), usageLimitReachedReason)
+
+	fresh := accountByAuthID(t, store.Snapshot(now), "auth-1")
+	fresh.Quota = ParsedQuota{
+		Family:     AccountFamilyWeekly,
+		LongWindow: &QuotaWindow{Kind: WindowWeekly, UsedPercent: float64Ptr(20), ResetAt: now.Add(48 * time.Hour)},
+	}
+	fresh.Family = AccountFamilyWeekly
+	fresh.LastSuccessAt = now
+	if !store.ApplyQuotaRefreshSuccessIfAdmissionCurrent(fresh, version, now) {
+		t.Fatal("fresh quota refresh was rejected")
+	}
+	account := accountByAuthID(t, store.Snapshot(now), "auth-1")
+	if account.TemporaryExhausted {
+		t.Fatalf("temporary exhaustion survived long-window fallback evidence: %#v", account)
 	}
 }

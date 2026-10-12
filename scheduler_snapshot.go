@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -86,9 +89,62 @@ func schedulerPickPublished(req pluginapi.SchedulerPickRequest, now time.Time) P
 		return observeSchedulerDecision(snapshot, req, PickDecision{AuthID: result.AuthID, Handled: true, Reason: "selected"}, now)
 	}
 	if snapshot.Fallback == FallbackFillFirst {
-		return observeSchedulerDecision(snapshot, req, PickDecision{Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinFillFirst, Reason: result.Reason}, now)
+		return observeSchedulerDecision(snapshot, req, PickDecision{Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinFillFirst, Reason: result.Reason, UnavailableSummary: fallbackUnavailableSummary(*snapshot, candidates, now)}, now)
 	}
 	return observeSchedulerDecision(snapshot, req, PickDecision{Reason: result.Reason}, now)
+}
+
+// fallbackUnavailableSummary explains why no account was selectable. The pick
+// path never builds an Ordered list, so without this the fallback log would
+// always claim "no ordered candidates" even when candidates were offered and
+// every one of them was excluded.
+func fallbackUnavailableSummary(snapshot SchedulerSnapshot, candidates []Candidate, now time.Time) string {
+	eligible := make(map[string]struct{}, len(candidates))
+	for _, c := range candidates {
+		if c.ID == "" || c.Provider != "codex" {
+			continue
+		}
+		if _, ok := snapshot.ActiveHighestTier[c.ID]; ok {
+			eligible[c.ID] = struct{}{}
+		}
+	}
+	if len(eligible) == 0 {
+		return "no ordered candidates"
+	}
+	counts := make(map[string]int, len(eligible))
+	for _, a := range snapshot.Accounts {
+		if _, ok := eligible[a.ID]; !ok {
+			continue
+		}
+		counts[accountExclusionReason(a, now)]++
+	}
+	parts := make([]string, 0, len(counts))
+	for reason, count := range counts {
+		parts = append(parts, fmt.Sprintf("%s=%d", reason, count))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
+func accountExclusionReason(a AccountView, now time.Time) string {
+	switch {
+	case a.AuthBlocked:
+		return "auth_failure"
+	case a.Circuit == CircuitOpen:
+		return "circuit_open"
+	case a.Circuit == CircuitHalfOpen:
+		return "circuit_half_open"
+	case a.TemporaryUnavailable:
+		return "temporary_exhausted"
+	case a.Trial != TrialNone:
+		return "trial_pending"
+	case a.Exhausted && (a.ResetAt.IsZero() || a.ResetAt.After(now)):
+		return "window_exhausted"
+	case a.Cache == CacheStale && !a.LastKnownAvailable:
+		return "stale_quota"
+	default:
+		return "available"
+	}
 }
 
 func observeSchedulerDecision(snapshot *SchedulerSnapshot, req pluginapi.SchedulerPickRequest, decision PickDecision, now time.Time) PickDecision {
@@ -136,11 +192,11 @@ func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *Tri
 	}
 	return AccountView{
 		ID: a.AuthID, AuthIndex: a.AuthIndex, Instance: a.Instance,
-		PluginPriority: a.Annotation.SchedulerPriority, Family: a.Family,
+		PluginPriority: a.Annotation.SchedulerPriority, CPAPriority: a.Priority, Family: a.Family,
 		Cache: cache, LastKnownAvailable: a.LastError == "", Exhausted: exhausted,
 		ResetAt: reset, AuthBlocked: a.Refresh.AuthFailure, Circuit: circuitClass,
 		TemporaryUnavailable: a.TemporaryExhausted && a.TemporaryResetAt.After(now),
-		Trial:                trial, Expiry: accountSortTime(a), RemainingQuota: remainingQuota(a),
+		Trial:                trial, Expiry: accountSortTime(a), RemainingQuota: remainingQuota(a), QuotaPressure: quotaPressure(a, now),
 	}
 }
 
@@ -172,4 +228,31 @@ func remainingQuota(a AccountState) float64 {
 		}
 	}
 	return 0
+}
+
+const minimumQuotaPressureWindow = 30 * time.Minute
+
+// quotaPressure estimates how quickly the remaining long-window quota must be
+// consumed before reset. A 30-minute floor keeps the score bounded close to a
+// reset. Unknown long-window usage has no pressure and falls through to the
+// deterministic expiry/remaining-quota tie breakers.
+func quotaPressure(a AccountState, now time.Time) float64 {
+	window := a.Quota.LongWindow
+	if window == nil || window.UsedPercent == nil || window.ResetAt.IsZero() {
+		return 0
+	}
+	untilReset := window.ResetAt.Sub(now)
+	if untilReset <= 0 {
+		return 0
+	}
+	if untilReset < minimumQuotaPressureWindow {
+		untilReset = minimumQuotaPressureWindow
+	}
+	remaining := 100 - *window.UsedPercent
+	if remaining < 0 {
+		remaining = 0
+	} else if remaining > 100 {
+		remaining = 100
+	}
+	return remaining / untilReset.Hours()
 }

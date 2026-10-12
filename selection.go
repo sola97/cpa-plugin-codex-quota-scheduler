@@ -43,6 +43,7 @@ type AccountView struct {
 	AuthIndex            string
 	Instance             AuthInstanceID
 	PluginPriority       int
+	CPAPriority          int
 	Family               AccountFamily
 	Cache                CacheClass
 	LastKnownAvailable   bool
@@ -54,6 +55,7 @@ type AccountView struct {
 	Trial                TrialState
 	Expiry               time.Time
 	RemainingQuota       float64
+	QuotaPressure        float64
 }
 
 type Candidate struct{ ID, Provider string }
@@ -133,11 +135,20 @@ func selectAccountSkipping(snapshot SchedulerSnapshot, candidates []Candidate, n
 }
 
 func accountViewLess(a, b AccountView, mode MonthlyMode) bool {
+	// CPA priority tiers lead within an availability class: a lower tier is
+	// only reached when higher tiers have no selectable account. Single-tier
+	// deployments see no change (equal priorities fall through).
+	if a.CPAPriority != b.CPAPriority {
+		return a.CPAPriority > b.CPAPriority
+	}
 	if a.PluginPriority != b.PluginPriority {
 		return a.PluginPriority > b.PluginPriority
 	}
 	if mode == MonthlyModePriority && a.Family != b.Family {
 		return a.Family == AccountFamilyMonthly
+	}
+	if a.QuotaPressure != b.QuotaPressure {
+		return a.QuotaPressure > b.QuotaPressure
 	}
 	if !a.Expiry.Equal(b.Expiry) {
 		if a.Expiry.IsZero() {

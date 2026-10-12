@@ -231,16 +231,20 @@ func runSection12C04AllProbePathsAtEveryKPoint(t *testing.T) {
 			t.Run(path.name+"/"+point, func(t *testing.T) {
 				controller := NewProbeController(now)
 				windowLength := 5 * time.Hour
+				windowKind := WindowFiveHour
 				if path.window == ProbeWindowLong {
 					windowLength = 7 * 24 * time.Hour
+					windowKind = WindowWeekly
 				}
-				baseline := ResetProbeBaseline(now.Add(-time.Hour), 80, windowLength)
+				baseline := ResetProbeBaseline(now.Add(-time.Hour), 0, windowLength)
+				baseline.WindowKind = windowKind
+				baseline.SuspectedLazy = true
 				controller.SetWindow(1, path.window, ProbeWindow{State: path.state, Baseline: baseline, Deadline: now})
 				precheck := controller.Advance(1, ProbeEvent{Kind: ProbeEventDeadline, Window: path.window, Now: now})
 				if len(precheck) != 1 || precheck[0].Class != OperationProbePrecheck {
 					t.Fatalf("path=%s precheck=%#v", path.name, precheck)
 				}
-				send := controller.Advance(1, ProbeEvent{Kind: ProbeEventPrecheckResult, Window: path.window, Now: now, Snapshots: map[ProbeWindowKind]QuotaSnapshot{path.window: {Valid: true, ResetAt: ptrTime(now.Add(-time.Hour)), Usage: ptrFloat(80)}}})
+				send := controller.Advance(1, ProbeEvent{Kind: ProbeEventPrecheckResult, Window: path.window, Now: now, Snapshots: map[ProbeWindowKind]QuotaSnapshot{path.window: {Valid: true, ResetAt: ptrTime(now.Add(windowLength)), Usage: ptrFloat(0), WindowKind: windowKind, WindowLength: windowLength, WindowLengthKnown: true}}})
 				if len(send) != 1 || send[0].Class != OperationProbeSend {
 					t.Fatalf("path=%s send=%#v", path.name, send)
 				}
@@ -265,7 +269,7 @@ func runSection12C04AllProbePathsAtEveryKPoint(t *testing.T) {
 					err = wal.ExecuteSend(func() error { return nil })
 				}
 				if err == nil {
-					err = wal.PersistSent(1, now.Add(time.Second))
+					err = wal.PersistSent(1, attempt.AttemptID, now.Add(time.Second))
 				}
 				if !errors.Is(err, testsupport.ErrInjectedCrash) {
 					t.Fatalf("crash=%s err=%v", point, err)
@@ -300,12 +304,12 @@ func runSection12C04AllProbePathsAtEveryKPoint(t *testing.T) {
 				if len(intents) != 1 || intents[0].Class != OperationProbeVerify || intents[0].StartedAfter != 9 || intents[0].AttemptID != path.name || !reflect.DeepEqual(intents[0].Payload, windows) {
 					t.Fatalf("recovery intents=%#v", intents)
 				}
-				restartedController.Advance(1, ProbeEvent{Kind: ProbeEventVerifyResult, Window: path.window, Now: now.Add(4 * time.Second), Snapshots: map[ProbeWindowKind]QuotaSnapshot{path.window: {Valid: true, ResetAt: ptrTime(now.Add(windowLength)), Usage: ptrFloat(0)}}})
+				restartedController.Advance(1, ProbeEvent{Kind: ProbeEventVerifyResult, Window: path.window, Now: now.Add(4 * time.Second), Snapshots: map[ProbeWindowKind]QuotaSnapshot{path.window: {Valid: true, ResetAt: ptrTime(now.Add(windowLength)), Usage: ptrFloat(1), WindowKind: windowKind, WindowLength: windowLength, WindowLengthKnown: true}}})
 				window, ok := restartedController.Window(1, path.window)
 				if !ok || window.State != ProbeConfirmed {
 					t.Fatalf("path=%s verify terminal window=%#v ok=%v", path.name, window, ok)
 				}
-				if err := restart.Complete(1); err != nil {
+				if err := restart.Complete(1, path.name, ProbeAttemptSending, ProbeAttemptSent, ProbeAttemptSentUnknown); err != nil {
 					t.Fatal(err)
 				}
 				if err := runtime.persistProbeWindows(); err != nil {
@@ -581,7 +585,9 @@ func runSection12D01CredentialIdentityMatrix(t *testing.T) {
 		"with-id":    json.RawMessage(`{"access_token":"a","account_id":"stored"}`),
 		"without-id": json.RawMessage(`{"access_token":"a"}`),
 	}, httpBody: quotaBody}
-	background := &QuotaRefresher{host: backgroundHost, state: NewPluginState(DefaultConfig()), now: func() time.Time { return now }, roster: HostRosterSnapshot{Capability: CapabilityA, Confirmed: true, BackgroundAllowed: true, Health: RosterHealthy}}
+	backgroundCfg := DefaultConfig()
+	backgroundCfg.EnableResetProbe = true
+	background := &QuotaRefresher{host: backgroundHost, state: NewPluginState(backgroundCfg), now: func() time.Time { return now }, roster: HostRosterSnapshot{Capability: CapabilityA, Confirmed: true, BackgroundAllowed: true, Health: RosterHealthy}}
 	coordinator := NewCoordinator(CoordinatorOptions{})
 	t.Cleanup(coordinator.Close)
 	held := &HeldLease{coordinator: coordinator}

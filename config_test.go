@@ -1,7 +1,9 @@
 package main
 
 import (
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,9 +51,31 @@ func TestProbeOnProvisionalRosterIsExplicitRiskOption(t *testing.T) {
 	}
 }
 
-func TestPluginRegistrationUsesV020SourceVersion(t *testing.T) {
-	if got := PluginRegistration().Metadata.Version; got != "0.2.0" {
-		t.Fatalf("plugin registration version = %q, want 0.2.0", got)
+func TestPluginRegistrationUsesV032SourceVersion(t *testing.T) {
+	if got := PluginRegistration().Metadata.Version; got != "0.3.2" {
+		t.Fatalf("plugin registration version = %q, want 0.3.2", got)
+	}
+}
+
+func TestReleaseVersionMetadataConsistent(t *testing.T) {
+	for _, check := range []struct {
+		path string
+		want []string
+	}{
+		{"config.go", []string{`var pluginVersion = "0.3.2"`}},
+		{"Makefile", []string{"VERSION ?= 0.3.2"}},
+		{"README.md", []string{"## v0.3.2 Highlights", "make package VERSION=0.3.2", "make checksums VERSION=0.3.2", "git tag -a v0.3.2 -m \"v0.3.2\"", "git push origin v0.3.2"}},
+		{"README.zh-CN.md", []string{"## v0.3.2 主要更新", "make package VERSION=0.3.2", "make checksums VERSION=0.3.2", "git tag -a v0.3.2 -m \"v0.3.2\"", "git push origin v0.3.2"}},
+	} {
+		contents, err := os.ReadFile(check.path)
+		if err != nil {
+			t.Fatalf("read %s: %v", check.path, err)
+		}
+		for _, want := range check.want {
+			if !strings.Contains(string(contents), want) {
+				t.Errorf("%s missing %q", check.path, want)
+			}
+		}
 	}
 }
 
@@ -131,6 +155,28 @@ refresh_on_startup: true
 	}
 	if !cfg.RefreshOnStartup {
 		t.Fatal("RefreshOnStartup = false, want true")
+	}
+}
+
+func TestAuthFailureRetryIntervalConfig(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.AuthFailureRetryInterval != 30*time.Minute {
+		t.Fatalf("default AuthFailureRetryInterval = %s, want 30m", cfg.AuthFailureRetryInterval)
+	}
+	cfg, err := DecodeConfig([]byte("auth_failure_retry_interval: 2h\n"))
+	if err != nil {
+		t.Fatalf("DecodeConfig returned error: %v", err)
+	}
+	if cfg.AuthFailureRetryInterval != 2*time.Hour {
+		t.Fatalf("AuthFailureRetryInterval = %s, want 2h", cfg.AuthFailureRetryInterval)
+	}
+	if _, err := DecodeConfig([]byte("auth_failure_retry_interval: 0s\n")); err == nil {
+		t.Fatal("DecodeConfig accepted non-positive auth_failure_retry_interval")
+	}
+	cfg.AuthFailureRetryInterval = 0
+	normalized := NormalizeConfig(cfg)
+	if normalized.AuthFailureRetryInterval != 30*time.Minute {
+		t.Fatalf("normalized AuthFailureRetryInterval = %s, want 30m", normalized.AuthFailureRetryInterval)
 	}
 }
 

@@ -18,6 +18,15 @@ type probeReadResult struct {
 	Quota       ParsedQuota
 	Credentials CodexCredentials
 }
+type probeActivationStatusError struct {
+	status int
+	body   []byte
+}
+
+func (e probeActivationStatusError) Error() string {
+	return fmt.Sprintf("probe activation request returned status %d: response body: %s", e.status, sanitizedBodySummary(e.body))
+}
+
 type probeSequencePayload struct {
 	Binding  RuntimeBinding
 	Windows  []ProbeWindowKind
@@ -45,9 +54,45 @@ func (r *QuotaRefresher) bootstrapProbeWindows() error {
 	if r.probeController == nil || !r.state.Config().EnableResetProbe {
 		return nil
 	}
+	bindings := map[string]RuntimeBinding{}
+	if r.bindings != nil {
+		r.bindings.mu.RLock()
+		for authID, binding := range r.bindings.bindings {
+			bindings[authID] = binding
+		}
+		r.bindings.mu.RUnlock()
+	}
+	// The roster-hold mutex is also the Probe controller/persistence
+	// linearization boundary. Keep snapshot-and-merge ordered with authoritative
+	// reconciliation so a stale bootstrap snapshot cannot resurrect a window.
+	r.probeHoldMu.Lock()
+	defer r.probeHoldMu.Unlock()
 	now := r.now()
+	observationInterval := r.probeObservationInterval()
+	touched := map[AuthInstanceID]struct{}{}
+	for instance := range r.probePersistPending {
+		touched[instance] = struct{}{}
+	}
+	for instance, windows := range r.probeController.Snapshot() {
+		for kind, window := range windows {
+			if window.State != ProbeWaitingReset || window.Baseline.Kind != ProbeBaselineReset || window.Baseline.WindowLength <= 0 {
+				continue
+			}
+			deadline := deadlineFor(window.Baseline, now, observationInterval)
+			if window.Deadline.IsZero() || deadline.Before(window.Deadline) {
+				window.Deadline = deadline
+				r.probeController.SetWindow(instance, kind, window)
+				touched[instance] = struct{}{}
+			}
+		}
+	}
 	for _, a := range r.state.Snapshot(now).Accounts {
-		b, ok := r.bindings.Lookup(a.AuthID)
+		observedAt := a.LastSuccessAt
+		strictObservation := !observedAt.IsZero() && !observedAt.After(now)
+		if !strictObservation {
+			observedAt = now
+		}
+		b, ok := bindings[a.AuthID]
 		if !ok {
 			continue
 		}
@@ -58,35 +103,136 @@ func (r *QuotaRefresher) bootstrapProbeWindows() error {
 			if pair.w == nil {
 				continue
 			}
-			if _, ok := r.probeController.Window(b.Instance, pair.k); ok {
+			if existing, ok := r.probeController.Window(b.Instance, pair.k); ok {
+				rearmObservedAt := observedAt
+				if !strictObservation {
+					rearmObservedAt = time.Time{}
+				}
+				if rearmed, changed := rearmConfirmedProbeWindow(existing, rearmObservedAt, pair.w, now, observationInterval); changed {
+					if r.runtimeRoster().Capability != CapabilityA {
+						rearmed.State = ProbeWaitingRoster
+						rearmed.Deadline = time.Time{}
+					}
+					r.probeController.SetWindow(b.Instance, pair.k, rearmed)
+					touched[b.Instance] = struct{}{}
+					continue
+				}
+				if existing.Baseline.Kind == ProbeBaselineReset && existing.Baseline.WindowLength == 0 {
+					if duration, durationKnown := probeWindowDuration(*pair.w); durationKnown {
+						existing.Baseline.WindowLength = duration
+						if existing.Baseline.WindowKind == "" {
+							existing.Baseline.WindowKind = pair.w.Kind
+						}
+						if strictObservation && looksLikeStrictLazyObservation(observedAt, *pair.w, duration) {
+							existing.Baseline.ResetAt = pair.w.ResetAt
+							existing.Baseline.Usage = *pair.w.UsedPercent
+							existing.Baseline.SuspectedLazy = true
+							existing.State = ProbePendingCheck
+							existing.Deadline = time.Time{}
+						} else if existing.State == ProbeWaitingReset {
+							existing.Deadline = deadlineFor(existing.Baseline, now, observationInterval)
+							if !existing.Deadline.After(now) {
+								existing.State = ProbePendingCheck
+								existing.Deadline = time.Time{}
+							}
+						}
+						if r.runtimeRoster().Capability != CapabilityA {
+							existing.State = ProbeWaitingRoster
+							existing.Deadline = time.Time{}
+						}
+						r.probeController.SetWindow(b.Instance, pair.k, existing)
+						touched[b.Instance] = struct{}{}
+					}
+				}
 				continue
 			}
 			usage := 0.0
 			if pair.w.UsedPercent != nil {
 				usage = *pair.w.UsedPercent
 			}
+			duration, durationKnown := probeWindowDuration(*pair.w)
 			base := ResetProbeBaseline(pair.w.ResetAt, usage, 0)
+			base.WindowKind = pair.w.Kind
+			if durationKnown {
+				base.WindowLength = duration
+			}
 			state := ProbeWaitingReset
-			deadline := pair.w.ResetAt.Add(probeRefreshAfterResetDelay)
-			if !deadline.After(now) {
+			deadline := deadlineFor(base, now, observationInterval)
+			lazy := false
+			if strictObservation {
+				_, lazy = firstObservationLazyWindow(observedAt, *pair.w)
+			}
+			if lazy {
+				base.SuspectedLazy = true
 				state = ProbePendingCheck
-				deadline = now
+				deadline = time.Time{}
+			} else if !deadline.After(now) {
+				state = ProbePendingCheck
+				deadline = time.Time{}
 			}
 			if r.runtimeRoster().Capability != CapabilityA {
 				state = ProbeWaitingRoster
 				deadline = time.Time{}
 			}
 			r.probeController.SetWindow(b.Instance, pair.k, ProbeWindow{State: state, Baseline: base, Deadline: deadline})
+			touched[b.Instance] = struct{}{}
 		}
 	}
-	return r.persistProbeWindows()
+	err := r.persistProbeInstances(touched)
+	if err != nil {
+		if r.probePersistPending == nil {
+			r.probePersistPending = map[AuthInstanceID]struct{}{}
+		}
+		for instance := range touched {
+			r.probePersistPending[instance] = struct{}{}
+		}
+	} else {
+		for instance := range touched {
+			delete(r.probePersistPending, instance)
+		}
+	}
+	if err == nil && len(touched) > 0 {
+		r.wakeRefreshLoop()
+	}
+	return err
+}
+
+func (r *QuotaRefresher) probeObservationInterval() time.Duration {
+	interval := NormalizeConfig(r.state.Config()).QuotaRefreshInterval
+	if interval < probeUnknownResetRecheck {
+		return probeUnknownResetRecheck
+	}
+	return interval
+}
+
+func (r *QuotaRefresher) persistProbeInstances(instances map[AuthInstanceID]struct{}) error {
+	if r.runtimeStore == nil || r.probeController == nil || len(instances) == 0 {
+		return nil
+	}
+	snapshot := r.probeController.Snapshot()
+	_, err := r.runtimeStore.Update(func(state *PersistentState) error {
+		for instance := range instances {
+			if windows, ok := snapshot[instance]; ok {
+				state.ProbeWindows[instance] = windows
+			} else {
+				delete(state.ProbeWindows, instance)
+			}
+		}
+		return nil
+	})
+	return err
 }
 func (r *QuotaRefresher) persistProbeWindows() error {
 	if r.runtimeStore == nil || r.probeController == nil {
 		return nil
 	}
 	snapshot := r.probeController.Snapshot()
-	_, err := r.runtimeStore.Update(func(s *PersistentState) error { s.ProbeWindows = snapshot; return nil })
+	_, err := r.runtimeStore.Update(func(s *PersistentState) error {
+		for instance, windows := range snapshot {
+			s.ProbeWindows[instance] = windows
+		}
+		return nil
+	})
 	return err
 }
 
@@ -112,14 +258,27 @@ func (r *QuotaRefresher) reconcileObservedProbeWindows(instance AuthInstanceID, 
 	if r.runtimeStore == nil || r.probeController == nil || instance == 0 {
 		return nil
 	}
-	observed := map[ProbeWindowKind]bool{
-		ProbeWindowFiveHour: quota.FiveHour != nil,
-		ProbeWindowLong:     quota.LongWindow != nil,
+	r.probeHoldMu.Lock()
+	defer r.probeHoldMu.Unlock()
+	observed := map[ProbeWindowKind]*QuotaWindow{
+		ProbeWindowFiveHour: quota.FiveHour,
+		ProbeWindowLong:     quota.LongWindow,
 	}
+	now := r.now()
+	observationInterval := r.probeObservationInterval()
 	updated, err := r.runtimeStore.Update(func(persisted *PersistentState) error {
 		attempt := persisted.ProbeAttempts[instance]
-		for kind, present := range observed {
-			if present || (nonterminalProbeAttempt(attempt) && attemptReferencesWindow(attempt, kind)) {
+		for kind, observation := range observed {
+			window, exists := persisted.ProbeWindows[instance][kind]
+			if observation != nil {
+				if exists {
+					if rearmed, changed := rearmConfirmedProbeWindow(window, now, observation, now, observationInterval); changed {
+						persisted.ProbeWindows[instance][kind] = rearmed
+					}
+				}
+				continue
+			}
+			if window.State == ProbeConfirmed || (nonterminalProbeAttempt(attempt) && attemptReferencesWindow(attempt, kind)) {
 				continue
 			}
 			delete(persisted.ProbeWindows[instance], kind)
@@ -132,14 +291,190 @@ func (r *QuotaRefresher) reconcileObservedProbeWindows(instance AuthInstanceID, 
 	if err != nil {
 		return err
 	}
+	for kind := range observed {
+		if window, retained := updated.ProbeWindows[instance][kind]; retained {
+			r.probeController.SetWindow(instance, kind, window)
+		} else {
+			r.probeController.RemoveWindow(instance, kind)
+		}
+	}
+	r.wakeRefreshLoop()
+	return nil
+}
+
+func rearmConfirmedProbeWindow(window ProbeWindow, observedAt time.Time, observation *QuotaWindow, now time.Time, observationInterval time.Duration) (ProbeWindow, bool) {
+	if window.State != ProbeConfirmed || observation == nil || observation.UsedPercent == nil || observation.ResetAt.IsZero() || observedAt.IsZero() || observedAt.After(now) {
+		return window, false
+	}
+	duration, durationKnown := probeWindowDuration(*observation)
+	if !durationKnown || duration <= 0 {
+		return window, false
+	}
+	if window.Baseline.Kind == ProbeBaselineReset && !window.Baseline.ResetAt.IsZero() && !observation.ResetAt.After(window.Baseline.ResetAt.Add(probeSkewTolerance)) {
+		return window, false
+	}
+	base := ResetProbeBaseline(observation.ResetAt, *observation.UsedPercent, duration)
+	base.WindowKind = observation.Kind
+	window.Baseline = base
+	window.AttemptID = ""
+	window.RetryCount = 0
+	if looksLikeStrictLazyObservation(observedAt, *observation, duration) {
+		window.Baseline.SuspectedLazy = true
+		window.State = ProbePendingCheck
+		window.Deadline = time.Time{}
+	} else {
+		window.State = ProbeWaitingReset
+		window.Deadline = deadlineFor(window.Baseline, now, observationInterval)
+	}
+	return window, true
+}
+
+func (r *QuotaRefresher) syncProbeControllerInstance(instance AuthInstanceID, state PersistentState) {
+	if r.probeController == nil {
+		return
+	}
+	r.probeController.ReplaceInstance(instance, state.ProbeWindows[instance])
+}
+
+func (r *QuotaRefresher) syncProbeControllerInstanceFromStore(instance AuthInstanceID) {
+	if r.runtimeStore == nil {
+		return
+	}
+	state, err := r.runtimeStore.PersistentSnapshot()
+	if err == nil {
+		r.syncProbeControllerInstance(instance, state)
+	}
+}
+
+func (r *QuotaRefresher) persistTerminalProbeCompletion(instance AuthInstanceID, attemptID string, quota ParsedQuota, phases ...ProbeAttemptPhase) error {
+	if r.runtimeStore == nil || r.probeController == nil || instance == 0 {
+		return nil
+	}
+	r.probeHoldMu.Lock()
+	defer r.probeHoldMu.Unlock()
+	return r.persistTerminalProbeCompletionLocked(instance, attemptID, quota, phases...)
+}
+
+func (r *QuotaRefresher) persistVerifiedProbeCompletion(instance AuthInstanceID, attemptID string, quota ParsedQuota, phases ...ProbeAttemptPhase) error {
+	if r.runtimeStore == nil || r.probeController == nil || instance == 0 {
+		return nil
+	}
+	r.probeHoldMu.Lock()
+	defer r.probeHoldMu.Unlock()
+	r.probeController.Advance(instance, ProbeEvent{Kind: ProbeEventVerifyResult, Now: r.now(), Snapshots: probeSnapshots(quota)})
+	return r.persistTerminalProbeCompletionLocked(instance, attemptID, quota, phases...)
+}
+
+func (r *QuotaRefresher) persistTerminalProbeCompletionLocked(instance AuthInstanceID, attemptID string, quota ParsedQuota, phases ...ProbeAttemptPhase) error {
+	observed := map[ProbeWindowKind]bool{
+		ProbeWindowFiveHour: quota.FiveHour != nil,
+		ProbeWindowLong:     quota.LongWindow != nil,
+	}
+	controllerWindows := r.probeController.Snapshot()[instance]
+	windows := make(map[ProbeWindowKind]ProbeWindow, len(controllerWindows))
+	for kind, window := range controllerWindows {
+		windows[kind] = window
+	}
 	for kind, present := range observed {
 		if present {
 			continue
 		}
-		if _, retained := updated.ProbeWindows[instance][kind]; !retained {
+		delete(windows, kind)
+	}
+	_, err := r.runtimeStore.Update(func(persisted *PersistentState) error {
+		if _, err := exactProbeAttempt(persisted, instance, attemptID, phases...); err != nil {
+			return err
+		}
+		if len(windows) > 0 {
+			persisted.ProbeWindows[instance] = windows
+		} else {
+			delete(persisted.ProbeWindows, instance)
+		}
+		delete(persisted.ProbeAttempts, instance)
+		return nil
+	})
+	if err != nil {
+		r.syncProbeControllerInstanceFromStore(instance)
+		return err
+	}
+	for kind, present := range observed {
+		if !present {
 			r.probeController.RemoveWindow(instance, kind)
 		}
 	}
+	return nil
+}
+
+func (r *QuotaRefresher) persistProbeFailure(instance AuthInstanceID, attemptID string, windows []ProbeWindowKind, sent, authBlocked bool, login LoginEpoch, suppressUntil time.Time) error {
+	if r.runtimeStore == nil || r.probeController == nil || instance == 0 {
+		return nil
+	}
+	r.probeHoldMu.Lock()
+	defer r.probeHoldMu.Unlock()
+	controllerWindows := r.probeController.Snapshot()[instance]
+	now := r.now()
+	committed, err := r.runtimeStore.Update(func(state *PersistentState) error {
+		var attempt ProbeAttempt
+		var attemptErr error
+		if sent {
+			attempt, attemptErr = exactProbeAttempt(state, instance, attemptID, ProbeAttemptSending, ProbeAttemptSent, ProbeAttemptSentUnknown)
+		} else {
+			attempt, attemptErr = exactProbeAttempt(state, instance, attemptID, ProbeAttemptPrepared, ProbeAttemptSending)
+		}
+		if attemptErr != nil {
+			return attemptErr
+		}
+		if sent {
+			attempt.Phase = ProbeAttemptSentUnknown
+			if suppressUntil.After(attempt.SuppressUntil) {
+				attempt.SuppressUntil = suppressUntil
+			}
+			state.ProbeAttempts[instance] = attempt
+		} else if attempt.Phase == ProbeAttemptPrepared {
+			delete(state.ProbeAttempts, instance)
+		}
+
+		next := make(map[ProbeWindowKind]ProbeWindow, len(state.ProbeWindows[instance]))
+		for kind, window := range state.ProbeWindows[instance] {
+			next[kind] = window
+		}
+		for _, kind := range windows {
+			window, ok := controllerWindows[kind]
+			if !ok {
+				window, ok = next[kind]
+			}
+			if !ok || window.State == ProbeWaitingRoster {
+				continue
+			}
+			if authBlocked {
+				window.State = ProbeAuthBlocked
+				window.AuthBlockedAtLogin = login
+				window.Deadline = time.Time{}
+			} else {
+				if sent {
+					window.State = ProbeSentUnknown
+					window.AttemptID = attemptID
+				} else {
+					window.State = ProbeRetryWait
+					window.AttemptID = ""
+				}
+				window.RetryCount++
+				window.Deadline = now.Add(probeBackoff(window.RetryCount))
+			}
+			next[kind] = window
+		}
+		if len(next) > 0 {
+			state.ProbeWindows[instance] = next
+		} else {
+			delete(state.ProbeWindows, instance)
+		}
+		return nil
+	})
+	if err != nil {
+		r.syncProbeControllerInstanceFromStore(instance)
+		return err
+	}
+	r.syncProbeControllerInstance(instance, committed)
 	return nil
 }
 
@@ -169,40 +504,45 @@ func (r *QuotaRefresher) holdProbeForRoster() error {
 	if r.runtimeStore == nil || r.probeController == nil {
 		return nil
 	}
-	persisted, err := r.runtimeStore.PersistentSnapshot()
-	if err != nil {
-		return err
-	}
-	for instance, windows := range r.probeController.Snapshot() {
-		attempt, hasAttempt := persisted.ProbeAttempts[instance]
-		sent := hasAttempt && (attempt.Phase == ProbeAttemptSending || attempt.Phase == ProbeAttemptSent || attempt.Phase == ProbeAttemptSentUnknown)
-		sentWindows := make(map[ProbeWindowKind]struct{}, len(attempt.Windows))
-		if sent {
-			for _, kind := range attempt.Windows {
-				sentWindows[kind] = struct{}{}
-			}
-		}
-		for kind, window := range windows {
-			window.Deadline = time.Time{}
-			if _, belongsToSentAttempt := sentWindows[kind]; belongsToSentAttempt {
-				window.State = ProbeSentUnknown
-			} else {
-				window.State = ProbeWaitingRoster
-				window.AttemptID = ""
-			}
-			r.probeController.SetWindow(instance, kind, window)
-		}
-	}
 	snapshot := r.probeController.Snapshot()
-	_, err = r.runtimeStore.Update(func(s *PersistentState) error {
-		s.ProbeWindows = snapshot
-		for instance, attempt := range s.ProbeAttempts {
-			if attempt.Phase != ProbeAttemptSending && attempt.Phase != ProbeAttemptSent && attempt.Phase != ProbeAttemptSentUnknown {
+	committed, err := r.runtimeStore.Update(func(s *PersistentState) error {
+		for instance, windows := range snapshot {
+			attempt, hasAttempt := s.ProbeAttempts[instance]
+			sent := hasAttempt && (attempt.Phase == ProbeAttemptSending || attempt.Phase == ProbeAttemptSent || attempt.Phase == ProbeAttemptSentUnknown)
+			sentWindows := make(map[ProbeWindowKind]struct{}, len(attempt.Windows))
+			if sent {
+				for _, kind := range attempt.Windows {
+					sentWindows[kind] = struct{}{}
+				}
+			} else if hasAttempt {
 				delete(s.ProbeAttempts, instance)
+			}
+			next := make(map[ProbeWindowKind]ProbeWindow, len(windows))
+			for kind, window := range windows {
+				window.Deadline = time.Time{}
+				if _, belongsToSentAttempt := sentWindows[kind]; belongsToSentAttempt {
+					window.State = ProbeSentUnknown
+					window.AttemptID = attempt.AttemptID
+				} else if window.State != ProbeConfirmed {
+					window.State = ProbeWaitingRoster
+					window.AttemptID = ""
+				}
+				next[kind] = window
+			}
+			if len(next) > 0 {
+				s.ProbeWindows[instance] = next
+			} else {
+				delete(s.ProbeWindows, instance)
 			}
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	for instance := range snapshot {
+		r.syncProbeControllerInstance(instance, committed)
+	}
 	return err
 }
 
@@ -230,18 +570,25 @@ func (r *QuotaRefresher) recoverProbeFromRoster(bindings map[string]RuntimeBindi
 		return nil
 	}
 	now := r.now()
+	touched := make(map[AuthInstanceID]struct{}, len(bindings))
 	for _, binding := range bindings {
-		r.probeController.Advance(binding.Instance, ProbeEvent{Kind: ProbeEventRosterConfirmed, Now: now})
+		touched[binding.Instance] = struct{}{}
+		r.probeController.Advance(binding.Instance, ProbeEvent{Kind: ProbeEventRosterConfirmed, Now: now, ObservationInterval: r.probeObservationInterval()})
 		for _, kind := range []ProbeWindowKind{ProbeWindowFiveHour, ProbeWindowLong} {
+			if window, ok := r.probeController.Window(binding.Instance, kind); ok && window.State == ProbeAuthBlocked && binding.Login > window.AuthBlockedAtLogin {
+				window.State = ProbePendingCheck
+				window.Deadline = time.Time{}
+				r.probeController.SetWindow(binding.Instance, kind, window)
+			}
 			window, ok := r.probeController.Window(binding.Instance, kind)
 			if ok && window.State == ProbeWaitingReset && !window.Deadline.After(now) {
 				window.State = ProbePendingCheck
-				window.Deadline = now
+				window.Deadline = time.Time{}
 				r.probeController.SetWindow(binding.Instance, kind, window)
 			}
 		}
 	}
-	return r.persistProbeWindows()
+	return r.persistProbeInstances(touched)
 }
 
 func activeProbeBindings(roster HostRosterSnapshot, bindings map[string]RuntimeBinding) (map[string]RuntimeBinding, map[AuthInstanceID]struct{}) {
@@ -258,10 +605,61 @@ func activeProbeBindings(roster HostRosterSnapshot, bindings map[string]RuntimeB
 }
 
 func (r *QuotaRefresher) RunProbeDueOnce(ctx context.Context) error {
+	_, err := r.runProbeDueOnce(ctx)
+	return err
+}
+
+func (r *QuotaRefresher) runProbeDueOnce(ctx context.Context) (bool, error) {
+	return r.runProbeDueOnceWithAdmission(ctx, nil)
+}
+
+func (r *QuotaRefresher) runProbeDueOnceAdmitted(ctx context.Context, generation uint64) (bool, error) {
+	return r.runProbeDueOnceWithAdmission(ctx, &generation)
+}
+
+func (r *QuotaRefresher) runProbeDueOnceWithAdmission(ctx context.Context, generation *uint64) (bool, error) {
+	if !r.resetProbeEnabled() {
+		return false, nil
+	}
+	r.probeRunStateMu.Lock()
 	if !r.probeRunMu.TryLock() {
+		r.probeRerunPending = true
+		r.probeRunStateMu.Unlock()
+		return false, nil
+	}
+	if generation != nil && !r.probeLaunchAdmissionCurrentLocked(*generation) {
+		r.probeRunMu.Unlock()
+		r.probeRunStateMu.Unlock()
+		return false, nil
+	}
+	r.probeRerunPending = false
+	r.probeRunStateMu.Unlock()
+	var firstErr error
+	for {
+		err := r.runProbeDuePass(ctx)
+		if firstErr == nil {
+			firstErr = err
+		}
+		if err != nil {
+			r.finishProbeOwnerError(true)
+			return true, firstErr
+		}
+		r.probeRunStateMu.Lock()
+		if r.probeRerunPending {
+			r.probeRerunPending = false
+			r.probeRunStateMu.Unlock()
+			continue
+		}
+		r.probeRunMu.Unlock()
+		r.probeRunStateMu.Unlock()
+		return true, firstErr
+	}
+}
+
+func (r *QuotaRefresher) runProbeDuePass(ctx context.Context) error {
+	if !r.resetProbeEnabled() {
 		return nil
 	}
-	defer r.probeRunMu.Unlock()
 	if err := r.retryProbeRosterHold(); err != nil {
 		return err
 	}
@@ -318,7 +716,7 @@ func (r *QuotaRefresher) RunProbeDueOnce(ctx context.Context) error {
 		for _, k := range []ProbeWindowKind{ProbeWindowFiveHour, ProbeWindowLong} {
 			if w, ok := r.probeController.Window(b.Instance, k); ok && w.State == ProbeAuthBlocked && b.Login > w.AuthBlockedAtLogin {
 				w.State = ProbePendingCheck
-				w.Deadline = now
+				w.Deadline = time.Time{}
 				r.probeController.SetWindow(b.Instance, k, w)
 			}
 		}
@@ -335,6 +733,7 @@ func (r *QuotaRefresher) RunProbeDueOnce(ctx context.Context) error {
 			continue
 		}
 		var attempt ProbeAttempt
+		claimWindows := r.probeController.Snapshot()[b.Instance]
 		claimed, claimErr := r.runtimeStore.Update(func(s *PersistentState) error {
 			if existing, ok := s.ProbeAttempts[b.Instance]; ok && existing.AttemptID != "" {
 				attempt = existing
@@ -343,7 +742,11 @@ func (r *QuotaRefresher) RunProbeDueOnce(ctx context.Context) error {
 			s.ProbeAttemptSeq++
 			attempt = ProbeAttempt{Instance: b.Instance, AttemptID: fmt.Sprintf("probe-%d-%d", b.Instance, s.ProbeAttemptSeq), Windows: append([]ProbeWindowKind(nil), due...), Phase: ProbeAttemptPrepared, CreatedAt: now, VerifyNotBefore: now}
 			s.ProbeAttempts[b.Instance] = attempt
-			s.ProbeWindows = r.probeController.Snapshot()
+			if claimWindows != nil {
+				s.ProbeWindows[b.Instance] = claimWindows
+			} else {
+				delete(s.ProbeWindows, b.Instance)
+			}
 			return nil
 		})
 		if claimErr != nil {
@@ -367,8 +770,36 @@ func (r *QuotaRefresher) RunProbeDueOnce(ctx context.Context) error {
 }
 
 func (r *QuotaRefresher) RunProbeRecoveryOnce(ctx context.Context) error {
+	if !r.resetProbeEnabled() {
+		return nil
+	}
 	r.probeRunMu.Lock()
-	defer r.probeRunMu.Unlock()
+	return r.runProbeRecoveryOwned(ctx)
+}
+
+func (r *QuotaRefresher) runProbeRecoveryOnceAdmitted(ctx context.Context, generation uint64) (bool, error) {
+	if !r.resetProbeEnabled() {
+		return false, nil
+	}
+	r.probeRunMu.Lock()
+	r.probeRunStateMu.Lock()
+	if !r.probeLaunchAdmissionCurrentLocked(generation) {
+		r.probeRunMu.Unlock()
+		r.probeRunStateMu.Unlock()
+		return false, nil
+	}
+	r.probeRunStateMu.Unlock()
+	return true, r.runProbeRecoveryOwned(ctx)
+}
+
+func (r *QuotaRefresher) runProbeRecoveryOwned(ctx context.Context) (runErr error) {
+	defer func() {
+		if runErr != nil {
+			r.finishProbeOwnerError(true)
+			return
+		}
+		runErr = r.finishProbeRecoveryOwner(ctx)
+	}()
 	if err := r.retryProbeRosterHold(); err != nil {
 		return err
 	}
@@ -408,10 +839,12 @@ func (r *QuotaRefresher) RunProbeRecoveryOnce(ctx context.Context) error {
 		return err
 	}
 	var firstErr error
+	touched := map[AuthInstanceID]struct{}{}
 	if err = r.reconcileProbeOrphans(persisted, activeInstances); err != nil {
 		firstErr = err
 	}
 	for _, intent := range intents {
+		touched[intent.Instance] = struct{}{}
 		var authID string
 		var binding RuntimeBinding
 		for id, b := range bindings {
@@ -438,7 +871,16 @@ func (r *QuotaRefresher) RunProbeRecoveryOnce(ctx context.Context) error {
 			}
 			continue
 		}
-		intent.Payload = probeSequencePayload{Binding: binding, Windows: windows, Attempt: st.ProbeAttempts[intent.Instance], Recovery: true}
+		attempt := st.ProbeAttempts[intent.Instance]
+		for _, kind := range attempt.Windows {
+			if window, ok := r.probeController.Window(intent.Instance, kind); ok {
+				window.State = ProbeSentUnknown
+				window.AttemptID = attempt.AttemptID
+				window.Deadline = time.Time{}
+				r.probeController.SetWindow(intent.Instance, kind, window)
+			}
+		}
+		intent.Payload = probeSequencePayload{Binding: binding, Windows: windows, Attempt: attempt, Recovery: true}
 		result := r.coordinator.SubmitTyped(intent).Await(ctx)
 		if result.Err != nil {
 			if firstErr == nil {
@@ -447,12 +889,45 @@ func (r *QuotaRefresher) RunProbeRecoveryOnce(ctx context.Context) error {
 			continue
 		}
 	}
-	if err := r.persistProbeWindows(); err != nil {
+	if err := r.persistProbeInstances(touched); err != nil {
 		if firstErr == nil {
 			firstErr = err
 		}
 	}
 	return firstErr
+}
+
+func (r *QuotaRefresher) finishProbeRecoveryOwner(ctx context.Context) error {
+	for {
+		r.probeRunStateMu.Lock()
+		if !r.probeRerunPending {
+			r.probeRunMu.Unlock()
+			r.probeRunStateMu.Unlock()
+			return nil
+		}
+		r.probeRerunPending = false
+		r.probeRunStateMu.Unlock()
+		if err := r.runProbeDuePass(ctx); err != nil {
+			r.finishProbeOwnerError(true)
+			return err
+		}
+	}
+}
+
+func (r *QuotaRefresher) finishProbeOwnerError(recoverFirst bool) {
+	now := time.Now()
+	if r.now != nil {
+		now = r.now()
+	}
+	r.probeRunStateMu.Lock()
+	if recoverFirst {
+		r.probeRecoveryPending = true
+	}
+	r.publishProbeRetryLocked(now, true)
+	r.probeRerunPending = false
+	r.probeRunMu.Unlock()
+	r.probeRunStateMu.Unlock()
+	r.wakeRefreshLoop()
 }
 
 func (r *QuotaRefresher) recoverPreparedProbeAttempts() error {
@@ -463,12 +938,13 @@ func (r *QuotaRefresher) recoverPreparedProbeAttempts() error {
 	if err != nil {
 		return err
 	}
-	changed := false
+	prepared := map[AuthInstanceID]ProbeAttempt{}
 	now := r.now()
 	for instance, attempt := range state.ProbeAttempts {
 		if attempt.Phase != ProbeAttemptPrepared {
 			continue
 		}
+		prepared[instance] = attempt
 		for _, kind := range attempt.Windows {
 			window, ok := r.probeController.Window(instance, kind)
 			if !ok {
@@ -480,17 +956,19 @@ func (r *QuotaRefresher) recoverPreparedProbeAttempts() error {
 			window.Deadline = now
 			r.probeController.SetWindow(instance, kind, window)
 		}
-		delete(state.ProbeAttempts, instance)
-		changed = true
 	}
-	if !changed {
+	if len(prepared) == 0 {
 		return nil
 	}
 	windows := r.probeController.Snapshot()
 	_, err = r.runtimeStore.Update(func(persisted *PersistentState) error {
-		persisted.ProbeWindows = windows
-		for instance, attempt := range persisted.ProbeAttempts {
-			if attempt.Phase == ProbeAttemptPrepared {
+		for instance, attempt := range prepared {
+			if instanceWindows, ok := windows[instance]; ok {
+				persisted.ProbeWindows[instance] = instanceWindows
+			} else {
+				delete(persisted.ProbeWindows, instance)
+			}
+			if current, ok := persisted.ProbeAttempts[instance]; ok && current.AttemptID == attempt.AttemptID && current.Phase == ProbeAttemptPrepared {
 				delete(persisted.ProbeAttempts, instance)
 			}
 		}
@@ -505,6 +983,15 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 	case OperationProbeSequence:
 		p := intent.Payload.(probeSequencePayload)
 		attempt := p.Attempt
+		stage := "probe_start"
+		fields := func(windows []ProbeWindowKind) map[string]any {
+			return map[string]any{"auth_id": intent.AuthID, "attempt_id": attempt.AttemptID, "windows": append([]ProbeWindowKind(nil), windows...)}
+		}
+		recordLog := func(level, event, message string, fields map[string]any) {
+			if r.state != nil {
+				r.state.RecordLog(level, event, message, fields, r.now())
+			}
+		}
 		read := func() (probeReadResult, error) {
 			var auth pluginapi.HostAuthGetResponse
 			if err := held.DoHTTP(ctx, func(context.Context) error { var e error; auth, e = r.host.GetAuth(p.Binding.AuthIndex); return e }); err != nil {
@@ -523,6 +1010,43 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			quota, err := r.typedFetchQuota(ctx, held, credentials)
 			return probeReadResult{Quota: quota, Credentials: credentials}, err
 		}
+		recordFailure := func(err error, sent bool, windows []ProbeWindowKind) {
+			failureFields := fields(windows)
+			failureFields["error"] = "probe_operation_failed"
+			failureFields["error_category"] = "external_callback"
+			failureFields["stage"] = stage
+			var activationStatus probeActivationStatusError
+			var status quotaStatusError
+			switch {
+			case errors.As(err, &activationStatus):
+				failureFields["error"] = "activation_http_status"
+				failureFields["error_category"] = "upstream_http"
+				failureFields["http_status"] = activationStatus.status
+				failureFields["response_summary"] = sanitizedProbeResponseSummary(activationStatus.body)
+			case errors.As(err, &status):
+				failureFields["error"] = "quota_http_status"
+				failureFields["error_category"] = "upstream_http"
+				failureFields["http_status"] = status.status
+				failureFields["response_summary"] = sanitizedProbeResponseSummary(status.body)
+			case errors.Is(err, ErrCapabilityB):
+				failureFields["error"] = "background_not_authorized"
+				failureFields["error_category"] = "authorization"
+			case errors.Is(err, ErrAccountIdentityUnresolved):
+				failureFields["error"] = "account_identity_unresolved"
+				failureFields["error_category"] = "authorization"
+			case errors.Is(err, ErrProvisionalFingerprintMismatch):
+				failureFields["error"] = "credential_fingerprint_mismatch"
+				failureFields["error_category"] = "authorization"
+			case errors.Is(err, context.Canceled):
+				failureFields["error"] = "operation_canceled"
+				failureFields["error_category"] = "internal"
+			case errors.Is(err, context.DeadlineExceeded):
+				failureFields["error"] = "operation_deadline_exceeded"
+				failureFields["error_category"] = "internal"
+			}
+			failureFields["sent"] = sent
+			recordLog("warn", "probe.failed", "额度周期探测失败，已按安全策略处理", failureFields)
+		}
 		fail := func(err error, sent bool) OperationResult {
 			if r.runtimeRoster().Provisional && (errors.Is(err, ErrProvisionalFingerprintMismatch) || errors.Is(err, ErrCapabilityB)) {
 				r.clearProvisionalPermit()
@@ -533,44 +1057,30 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 				}
 				r.rosterMu.Unlock()
 				_ = r.persistProbeRosterHold()
+				recordFailure(err, sent, p.Windows)
 				return OperationResult{Token: intent.Token, Err: err}
 			}
 			if r.runtimeRoster().Health == RosterFailClosed {
+				recordFailure(err, sent, p.Windows)
 				return OperationResult{Token: intent.Token, Err: err}
 			}
-			if status, ok := err.(quotaStatusError); ok && status.status == http.StatusUnauthorized {
-				if persistErr := r.bindings.MarkAuthBlocked(intent.AuthID); persistErr != nil {
+			status, authBlocked := err.(quotaStatusError)
+			authBlocked = authBlocked && status.status == http.StatusUnauthorized
+			persistErr := r.persistProbeFailure(intent.Instance, attempt.AttemptID, p.Windows, sent, authBlocked, p.Binding.Login, attempt.SuppressUntil)
+			if persistErr != nil {
+				if !errors.Is(persistErr, ErrProbeAttemptChanged) {
 					err = persistErr
 				}
-				for _, k := range p.Windows {
-					if w, ok := r.probeController.Window(intent.Instance, k); ok {
-						w.State = ProbeAuthBlocked
-						w.AuthBlockedAtLogin = p.Binding.Login
-						w.Deadline = time.Time{}
-						r.probeController.SetWindow(intent.Instance, k, w)
-					}
-				}
-			} else {
-				for _, k := range p.Windows {
-					if w, ok := r.probeController.Window(intent.Instance, k); ok {
-						if sent {
-							w.State = ProbeSentUnknown
-						} else {
-							w.State = ProbeRetryWait
-						}
-						w.RetryCount++
-						w.Deadline = r.now().Add(probeBackoff(w.RetryCount))
-						r.probeController.SetWindow(intent.Instance, k, w)
-					}
+			} else if authBlocked && r.bindings != nil {
+				if blockErr := r.bindings.MarkAuthBlocked(intent.AuthID); blockErr != nil {
+					err = blockErr
 				}
 			}
-			if sent {
-				_ = r.probeWAL.PersistSentUnknown(intent.Instance, attempt.SuppressUntil)
-			}
-			_ = r.persistProbeWindows()
+			recordFailure(err, sent, p.Windows)
 			return OperationResult{Token: intent.Token, Err: err}
 		}
 		if p.Recovery {
+			stage = "recovery_verify_quota"
 			if attempt.SendFenceSeq == 0 {
 				attempt.SendFenceSeq = intent.StartedAfter
 			}
@@ -588,30 +1098,28 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			if err != nil {
 				return fail(err, true)
 			}
-			r.probeController.Advance(intent.Instance, ProbeEvent{Kind: ProbeEventVerifyResult, Now: r.now(), Snapshots: probeSnapshots(vr.Quota)})
-			if err = r.probeWAL.Complete(intent.Instance); err != nil {
-				return fail(err, true)
-			}
-			if err = r.reconcileObservedProbeWindows(intent.Instance, vr.Quota); err != nil {
+			stage = "persist_recovery_verification"
+			if err = r.persistVerifiedProbeCompletion(intent.Instance, attempt.AttemptID, vr.Quota, ProbeAttemptSending, ProbeAttemptSent, ProbeAttemptSentUnknown); err != nil {
+				recordFailure(err, true, p.Windows)
 				return OperationResult{Token: intent.Token, Err: err}
 			}
-			if err = r.persistProbeWindows(); err != nil {
-				return OperationResult{Token: intent.Token, Err: err}
-			}
+			recordLog("info", "probe.verified", "额度周期激活验证完成", fields(p.Windows))
 			res.ReadStartSeq = seq
 			res.Value = vr
 			return res
 		}
+		recordLog("info", "probe.precheck_started", "开始检查疑似未激活的额度周期", fields(p.Windows))
+		stage = "precheck_quota"
 		_, err := r.probeFence.Next() // actual-start precheck sequence, distinct from completedFence
 		if err != nil {
 			return fail(err, false)
 		}
 		pre, err := read()
 		if err != nil {
-			_ = r.probeWAL.Complete(intent.Instance)
 			return fail(err, false)
 		}
-		r.probeController.Advance(intent.Instance, ProbeEvent{Kind: ProbeEventPrecheckResult, Now: r.now(), Snapshots: probeSnapshots(pre.Quota)})
+		r.probeHoldMu.Lock()
+		r.probeController.Advance(intent.Instance, ProbeEvent{Kind: ProbeEventPrecheckResult, Now: r.now(), Snapshots: probeSnapshots(pre.Quota), ObservationInterval: r.probeObservationInterval()})
 		var lazy []ProbeWindowKind
 		for _, k := range p.Windows {
 			if w, ok := r.probeController.Window(intent.Instance, k); ok && w.State == ProbeSentAwaitingVerify {
@@ -621,17 +1129,15 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			}
 		}
 		if len(lazy) == 0 {
-			if err = r.probeWAL.Complete(intent.Instance); err != nil {
-				return fail(err, false)
-			}
-			if err = r.reconcileObservedProbeWindows(intent.Instance, pre.Quota); err != nil {
-				return OperationResult{Token: intent.Token, Err: err}
-			}
-			if err = r.persistProbeWindows(); err != nil {
+			err = r.persistTerminalProbeCompletionLocked(intent.Instance, attempt.AttemptID, pre.Quota, ProbeAttemptPrepared)
+			r.probeHoldMu.Unlock()
+			if err != nil {
+				recordFailure(err, false, p.Windows)
 				return OperationResult{Token: intent.Token, Err: err}
 			}
 			return res
 		}
+		r.probeHoldMu.Unlock()
 		fence, err := r.probeFence.Next()
 		if err != nil {
 			return fail(err, false)
@@ -641,10 +1147,12 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 		attempt.CreatedAt = r.now()
 		attempt.VerifyNotBefore = attempt.CreatedAt.Add(3 * time.Second)
 		attempt.SuppressUntil = attempt.CreatedAt.Add(10 * time.Minute)
+		stage = "persist_activation_prepared"
 		if err = r.probeWAL.PersistSending(attempt); err != nil {
 			return fail(err, false)
 		}
 		held.MarkProbeSent(attempt.SuppressUntil)
+		stage = "activation_post"
 		err = held.DoHTTP(ctx, func(context.Context) error {
 			return r.probeWAL.ExecuteSend(func() error {
 				resp, e := r.doBackgroundHTTPRequest(pluginapi.HTTPRequest{Method: http.MethodPost, URL: codexResetProbeEndpoint, Headers: http.Header{"Authorization": []string{"Bearer " + pre.Credentials.AccessToken}, "Chatgpt-Account-Id": []string{pre.Credentials.ChatGPTAccountID}, "Content-Type": []string{"application/json"}}, Body: resetProbePayloadBytes()}, true)
@@ -652,7 +1160,7 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 					return e
 				}
 				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-					return quotaStatusError{status: resp.StatusCode, body: resp.Body}
+					return probeActivationStatusError{status: resp.StatusCode, body: resp.Body}
 				}
 				return nil
 			})
@@ -660,9 +1168,12 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 		if err != nil {
 			return fail(err, true)
 		}
-		if err = r.probeWAL.PersistSent(intent.Instance, r.now()); err != nil {
+		stage = "persist_activation_sent"
+		if err = r.probeWAL.PersistSent(intent.Instance, attempt.AttemptID, r.now()); err != nil {
 			return fail(err, true)
 		}
+		recordLog("info", "probe.activation_sent", "已发送极小请求以激活额度周期", fields(lazy))
+		stage = "propagation_wait"
 		if err = held.WaitPropagation(ctx, 3*time.Second); err != nil {
 			return fail(err, true)
 		}
@@ -673,10 +1184,12 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 		if seq <= fence {
 			return fail(errors.New("verify read did not start after send fence"), true)
 		}
+		stage = "verify_quota"
 		vr, err := read()
 		if err != nil {
 			return fail(err, true)
 		}
+		r.probeHoldMu.Lock()
 		r.probeController.Advance(intent.Instance, ProbeEvent{Kind: ProbeEventVerifyResult, Now: r.now(), Snapshots: probeSnapshots(vr.Quota)})
 		for _, k := range lazy {
 			if w, ok := r.probeController.Window(intent.Instance, k); ok && w.State == ProbeRetryWait && w.Deadline.Before(attempt.SuppressUntil) {
@@ -684,15 +1197,14 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 				r.probeController.SetWindow(intent.Instance, k, w)
 			}
 		}
-		if err = r.probeWAL.Complete(intent.Instance); err != nil {
-			return fail(err, true)
-		}
-		if err = r.reconcileObservedProbeWindows(intent.Instance, vr.Quota); err != nil {
+		stage = "persist_verification"
+		err = r.persistTerminalProbeCompletionLocked(intent.Instance, attempt.AttemptID, vr.Quota, ProbeAttemptSent)
+		r.probeHoldMu.Unlock()
+		if err != nil {
+			recordFailure(err, true, lazy)
 			return OperationResult{Token: intent.Token, Err: err}
 		}
-		if err = r.persistProbeWindows(); err != nil {
-			return OperationResult{Token: intent.Token, Err: err}
-		}
+		recordLog("info", "probe.verified", "额度周期激活验证完成", fields(lazy))
 		res.ReadStartSeq = seq
 		res.Value = vr
 		return res
@@ -755,12 +1267,14 @@ func probeSnapshots(q ParsedQuota) map[ProbeWindowKind]QuotaSnapshot {
 		if p.w == nil {
 			continue
 		}
-		usage := 0.0
+		var usage *float64
 		if p.w.UsedPercent != nil {
-			usage = *p.w.UsedPercent
+			value := *p.w.UsedPercent
+			usage = &value
 		}
 		reset := p.w.ResetAt
-		out[p.k] = QuotaSnapshot{Valid: true, ResetAt: &reset, Usage: &usage}
+		length, lengthKnown := probeWindowDuration(*p.w)
+		out[p.k] = QuotaSnapshot{Valid: true, ResetAt: &reset, Usage: usage, WindowKind: p.w.Kind, WindowLength: length, WindowLengthKnown: lengthKnown}
 	}
 	return out
 }

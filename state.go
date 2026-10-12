@@ -103,16 +103,34 @@ func cloneCPAAdmission(value CPAAdmissionState) CPAAdmissionState {
 			cloned.AuthIDs[authID] = struct{}{}
 		}
 	}
+	for _, tier := range value.Tiers {
+		clonedTier := TierAdmission{Priority: tier.Priority, AuthIDs: make(map[string]struct{}, len(tier.AuthIDs))}
+		for authID := range tier.AuthIDs {
+			clonedTier.AuthIDs[authID] = struct{}{}
+		}
+		cloned.Tiers = append(cloned.Tiers, clonedTier)
+	}
 	return cloned
 }
 
 func equalCPAAdmission(left, right CPAAdmissionState) bool {
-	if left.Observed != right.Observed || left.Priority != right.Priority || len(left.AuthIDs) != len(right.AuthIDs) {
+	if left.Observed != right.Observed || left.Priority != right.Priority || len(left.AuthIDs) != len(right.AuthIDs) || len(left.Tiers) != len(right.Tiers) {
 		return false
 	}
 	for authID := range left.AuthIDs {
 		if _, ok := right.AuthIDs[authID]; !ok {
 			return false
+		}
+	}
+	for i, tier := range left.Tiers {
+		other := right.Tiers[i]
+		if tier.Priority != other.Priority || len(tier.AuthIDs) != len(other.AuthIDs) {
+			return false
+		}
+		for authID := range tier.AuthIDs {
+			if _, ok := other.AuthIDs[authID]; !ok {
+				return false
+			}
 		}
 	}
 	return true
@@ -129,12 +147,25 @@ func (s *PluginState) ReplaceCPAAdmission(value CPAAdmissionState) uint64 {
 	if !value.Observed {
 		return s.cpaAdmissionVersion
 	}
+	priorityByAuthID := make(map[string]int, len(value.AuthIDs))
+	for _, tier := range value.Tiers {
+		for authID := range tier.AuthIDs {
+			priorityByAuthID[authID] = tier.Priority
+		}
+	}
 	for key, account := range s.accounts {
 		if _, ok := value.AuthIDs[account.AuthID]; !ok {
 			delete(s.accounts, key)
 			continue
 		}
-		account.Priority = value.Priority
+		// Accounts keep the priority of their own tier; a single-tier
+		// admission (legacy or across-priorities disabled) overwrites with the
+		// tier priority as before.
+		if tierPriority, ok := priorityByAuthID[account.AuthID]; ok {
+			account.Priority = tierPriority
+		} else {
+			account.Priority = value.Priority
+		}
 		s.accounts[key] = account
 	}
 	return s.cpaAdmissionVersion
@@ -192,7 +223,29 @@ func (s *PluginState) AdmittedCPAPriorityVersioned(authID string) (int, uint64, 
 		return 0, s.cpaAdmissionVersion, false
 	}
 	_, ok := s.cpaAdmission.AuthIDs[authID]
-	return s.cpaAdmission.Priority, s.cpaAdmissionVersion, ok
+	if !ok {
+		return 0, s.cpaAdmissionVersion, false
+	}
+	// The account's own tier decides its priority; single-tier admissions
+	// (legacy or across-priorities disabled) keep the top priority.
+	for _, tier := range s.cpaAdmission.Tiers {
+		if _, inTier := tier.AuthIDs[authID]; inTier {
+			return tier.Priority, s.cpaAdmissionVersion, true
+		}
+	}
+	return s.cpaAdmission.Priority, s.cpaAdmissionVersion, true
+}
+
+// admissionPriorityLocked returns the priority of the account's own tier,
+// falling back to the admission's top priority for single-tier admissions.
+// Callers must hold s.mu.
+func (s *PluginState) admissionPriorityLocked(authID string) int {
+	for _, tier := range s.cpaAdmission.Tiers {
+		if _, inTier := tier.AuthIDs[authID]; inTier {
+			return tier.Priority
+		}
+	}
+	return s.cpaAdmission.Priority
 }
 
 func (s *PluginState) CPAAdmissionVersionCurrent(version uint64) bool {
@@ -281,7 +334,97 @@ func (s *PluginState) RecordAccountSuccess(authID, authIndex string, now time.Ti
 	if !ok {
 		return AccountState{}, false
 	}
+	// A real successful request is the strongest recovery evidence: upstream
+	// quota percentages alone can misreport recovery (issue #11 negative
+	// control), so the temporary-exhaustion marker is only reconciled here and
+	// on operator-confirmed manual refreshes, never from a bare quota read.
+	account.TemporaryExhausted = false
+	account.TemporaryResetAt = time.Time{}
 	applyCircuitSuccess(&account, NormalizeConfig(s.cfg), now)
+	s.accounts[key] = account
+	return cloneAccountState(account), true
+}
+
+// ClearAccountTemporaryExhausted drops a stale temporary-exhaustion marker for
+// one account. Callers must hold verified recovery evidence: either a
+// successful real request (RecordAccountSuccess) or an operator-requested
+// refresh whose fresh quota snapshot shows remaining capacity in every known
+// window (QuotaRefresher.reconcileTemporaryExhausted).
+func (s *PluginState) ClearAccountTemporaryExhausted(authID string) bool {
+	if authID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, account, ok := s.findAccountLocked(authID, "")
+	if !ok || !account.TemporaryExhausted {
+		return false
+	}
+	account.TemporaryExhausted = false
+	account.TemporaryResetAt = time.Time{}
+	s.accounts[key] = account
+	return true
+}
+
+// ClearAccountAuthFailure unparks an account whose token refresh failed with
+// 401 after the operator re-logged in and the credential reconcile confirmed
+// an external login (new refresh token under the same auth file). It only
+// re-admits the account to the refresh pool; scheduling stays excluded until
+// the triggered refresh succeeds — recovery still needs quota evidence.
+func (s *PluginState) ClearAccountAuthFailure(authID string) bool {
+	if authID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, account, ok := s.findAccountLocked(authID, "")
+	if !ok || !account.Refresh.AuthFailure {
+		return false
+	}
+	account.Refresh.AuthFailure = false
+	account.Refresh.RetryAttempt = 0
+	account.Refresh.NextRetryAt = time.Time{}
+	s.accounts[key] = account
+	return true
+}
+
+// ObserveAccountQuota merges quota state observed inside a real response
+// stream into the cached account. An observation is bound to an actual call,
+// so it both refreshes the cache (deferring the polling refresh) and runs the
+// same window-identity reconciliation as a polled refresh. Only the windows
+// present in the observation are overwritten; everything else is preserved.
+func (s *PluginState) ObserveAccountQuota(authID, authIndex string, quota ParsedQuota, now time.Time) (AccountState, bool) {
+	if authID == "" && authIndex == "" {
+		return AccountState{}, false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, account, ok := s.findAccountLocked(authID, authIndex)
+	if !ok {
+		return AccountState{}, false
+	}
+	if quota.FiveHour != nil {
+		account.Quota.FiveHour = quota.FiveHour
+	}
+	if quota.LongWindow != nil {
+		account.Quota.LongWindow = quota.LongWindow
+	}
+	if quota.Family != "" {
+		account.Quota.Family = quota.Family
+		account.Family = quota.Family
+	}
+	account.LastRefreshAt = now
+	account.LastSuccessAt = now
+	account.LastObservedAt = now
+	account.Stale = false
+	if account.TemporaryExhausted && quotaRefreshConfirmsReset(account, now) {
+		account.TemporaryExhausted = false
+		account.TemporaryResetAt = time.Time{}
+		account.LastError = ""
+	}
 	s.accounts[key] = account
 	return cloneAccountState(account), true
 }
@@ -382,7 +525,7 @@ func (s *PluginState) RecordRefreshFailure(authID, authIndex string, kind Refres
 	account.Refresh.LastFailureAt = now
 	if kind == RefreshFailureAuth || kind == RefreshFailureLocal {
 		account.Refresh.AuthFailure = kind == RefreshFailureAuth
-		account.Refresh.NextRetryAt = time.Time{}
+		account.Refresh.NextRetryAt = s.authFailureRetryDeadlineLocked(now, kind)
 	} else {
 		account.Refresh.AuthFailure = false
 		account.Refresh.RetryAttempt++
@@ -401,13 +544,13 @@ func (s *PluginState) ApplyQuotaRefreshFailureIfAdmissionCurrent(account Account
 	if !s.admissionCurrentLocked(account.AuthID, version) {
 		return false
 	}
-	account.Priority = s.cpaAdmission.Priority
+	account.Priority = s.admissionPriorityLocked(account.AuthID)
 	account.LastError = message
 	account.Refresh.LastFailureKind = kind
 	account.Refresh.LastFailureAt = now
 	if kind == RefreshFailureAuth || kind == RefreshFailureLocal {
 		account.Refresh.AuthFailure = kind == RefreshFailureAuth
-		account.Refresh.NextRetryAt = time.Time{}
+		account.Refresh.NextRetryAt = s.authFailureRetryDeadlineLocked(now, kind)
 	} else {
 		account.Refresh.AuthFailure = false
 		account.Refresh.RetryAttempt++
@@ -430,9 +573,21 @@ func (s *PluginState) ApplyQuotaRefreshSuccessIfAdmissionCurrent(account Account
 	if !s.admissionCurrentLocked(account.AuthID, version) {
 		return false
 	}
-	account.Priority = s.cpaAdmission.Priority
+	account.Priority = s.admissionPriorityLocked(account.AuthID)
 	if !account.LastSuccessAt.IsZero() && account.LastError == "" {
 		account.Refresh = AccountRefreshState{}
+	}
+	// A successful quota read reconciles a stale temporary-exhaustion marker
+	// when the fresh snapshot carries strict evidence that a real upstream
+	// reset occurred: every known window must show remaining capacity AND the
+	// window identity must have changed since the marker was recorded. A
+	// same-window 100% reading alone does not clear the marker — generic quota
+	// percentages can misreport recovery while model requests still hit
+	// upstream 429 (issue #11's K12 negative control).
+	if account.TemporaryExhausted && quotaRefreshConfirmsReset(account, now) {
+		account.TemporaryExhausted = false
+		account.TemporaryResetAt = time.Time{}
+		account.LastError = ""
 	}
 	applyCircuitSuccess(&account, NormalizeConfig(s.cfg), now)
 	key := accountStateKey(account)
@@ -441,6 +596,29 @@ func (s *PluginState) ApplyQuotaRefreshSuccessIfAdmissionCurrent(account Account
 	}
 	s.accounts[key] = cloneAccountState(account)
 	return true
+}
+
+// quotaRefreshConfirmsReset reports whether a fresh quota snapshot proves an
+// actual upstream reset rather than a same-window misreport. With a five-hour
+// window present, the window's reset deadline must differ from the deadline
+// recorded when the marker was set (a reset mints a new window). Without one,
+// a usable long window that resets after the recorded marker deadline is
+// accepted as the weaker fallback evidence.
+func quotaRefreshConfirmsReset(account AccountState, now time.Time) bool {
+	if account.LastSuccessAt.IsZero() {
+		return false
+	}
+	longWindow := account.Quota.LongWindow
+	if longWindow != nil && !windowShowsRemainingCapacity(longWindow, now) {
+		return false
+	}
+	if fiveHour := account.Quota.FiveHour; fiveHour != nil {
+		if !windowShowsRemainingCapacity(fiveHour, now) {
+			return false
+		}
+		return !fiveHour.ResetAt.Equal(account.TemporaryResetAt)
+	}
+	return longWindow != nil && !longWindow.ResetAt.IsZero() && longWindow.ResetAt.After(account.TemporaryResetAt)
 }
 
 func (s *PluginState) RecordLog(level, event, message string, fields map[string]any, now time.Time) {
@@ -560,7 +738,9 @@ func (s *PluginState) NextRefreshDueAt(now time.Time) time.Time {
 		}
 	}
 	for _, account := range s.accounts {
-		if account.Refresh.AuthFailure || account.Refresh.LastFailureKind == RefreshFailureLocal {
+		// Local failures are structural and own no deadline. Auth failures keep
+		// their low-frequency retry deadline below so the loop wakes for them.
+		if account.Refresh.LastFailureKind == RefreshFailureLocal {
 			continue
 		}
 		if !account.Circuit.NextProbeAt.IsZero() {
@@ -623,9 +803,9 @@ func retainedLogs(logs []LogEntry, cfg Config, now time.Time) []LogEntry {
 
 func accountRefreshDue(account AccountState, cfg Config, now time.Time) (bool, string) {
 	cfg = NormalizeConfig(cfg)
-	if account.Refresh.AuthFailure {
-		return false, "auth_failure"
-	}
+	// Auth failures no longer park the account permanently: the flag keeps it
+	// excluded from scheduling, but the retry deadline below re-admits it to
+	// the refresh pool at the low-frequency backoff.
 	if account.Refresh.LastFailureKind == RefreshFailureLocal {
 		return false, "local_failure"
 	}
@@ -695,6 +875,18 @@ func retryDelayForAttempt(cfg Config, attempt int) time.Duration {
 		index = len(delays) - 1
 	}
 	return delays[index]
+}
+
+// authFailureRetryDeadlineLocked returns the retry deadline for terminal
+// refresh failures. Auth failures (401/invalid_grant) park the account from
+// scheduling but retry at the low-frequency backoff so an operator re-login
+// recovers without a manual refresh; local failures are structural and never
+// retry. Callers must hold s.mu.
+func (s *PluginState) authFailureRetryDeadlineLocked(now time.Time, kind RefreshFailureKind) time.Time {
+	if kind != RefreshFailureAuth {
+		return time.Time{}
+	}
+	return now.Add(NormalizeConfig(s.cfg).AuthFailureRetryInterval)
 }
 
 func accountStateKey(account AccountState) string {

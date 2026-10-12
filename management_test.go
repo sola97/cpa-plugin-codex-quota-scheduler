@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -25,6 +26,9 @@ func TestManagementRegisterExposesStatusResourceAndRoutes(t *testing.T) {
 	}
 	if resources["/status"].Menu == "" {
 		t.Fatalf("status resource Menu is empty: %#v", resources["/status"])
+	}
+	if resources["/status"].Menu != "Codex Scheduler" {
+		t.Fatalf("status resource Menu = %q, want English static label", resources["/status"].Menu)
 	}
 	if _, ok := resources["/status-data"]; ok {
 		t.Fatalf("status-data resource is still registered: %#v", resp.Resources)
@@ -709,9 +713,14 @@ func TestStatusHTMLUsesManagementAPIActionsModalProgressAndLogs(t *testing.T) {
 	}
 	html := string(resp.Body)
 	lower := strings.ToLower(html)
-	for _, want := range []string{"quota-bar", "editDialog", "logList", "openEdit", "exportLogs", "codex-quota-scheduler-logs.json", "maxLogEntries", "logRetention", "refreshOneQuota", "refreshStatus", "renderAccounts", "renderMetrics", "metricNextAuthID", "metricMonthlyMode", "metricLastSelected", "managementKey", "loadStatus", "MANAGEMENT_BASE", "/v0/management/plugins/codex-quota-scheduler", "authHeaders()", "localeSelect", "TRANSLATIONS", "codex-quota-scheduler-locale-v1", "Scheduler Settings", "Account Queue", "INLINE_TRANSLATIONS", "Reset credits", "Refresh Quota", `id="editSchedulerPriority"`, "account.schedulerPriority", "scheduler_priority", "Plugin priority", "插件优先级"} {
+	for _, want := range []string{"quota-bar", "editDialog", "logList", "openEdit", "exportLogs", "codex-quota-scheduler-logs.json", "maxLogEntries", "logRetention", "refreshOneQuota", "refreshStatus", "renderAccounts", "renderMetrics", "metricNextAuthID", "metricMonthlyMode", "metricLastSelected", "managementKeyField", "managementKey", "rememberManagementKey", "MANAGEMENT_KEY_STORAGE_KEY", "restoreRememberedManagementKey", "syncRememberedManagementKey", "syncManagementKeyVisibility", "showManagementKeyInput", "restoredManagementKey", "field.hidden=remember.checked&&restoredManagementKey", "togglePin", "createPinButton", "priority=pinned?0:999", "actions.pinAccount", "actions.unpinAccount", "notice.accountPinned", "notice.accountUnpinned", "codex-quota-scheduler-management-key-v1", "loadStatus", "MANAGEMENT_BASE", "/v0/management/plugins/codex-quota-scheduler", "authHeaders()", "localeSelect", "TRANSLATIONS", "codex-quota-scheduler-locale-v1", "Scheduler Settings", "Account Queue", "INLINE_TRANSLATIONS", "Reset credits", "Refresh Quota", "editSchedulerPriority", "account.schedulerPriority", "scheduler_priority", "Plugin priority", "插件优先级", "quotaResetTime", "resetRemainingText", "Math.floor(remaining/minute)", "Math.floor(remaining/hour)", "Math.floor(remaining/day)", "已到期", "quota-remaining", "quota-reset-label", "formatQuotaResetLabels", "label+' reset: '", "SORTED_INLINE_TRANSLATIONS", "right[0].length-left[0].length", "Circuit counts", "localeColon", "resetCreditCount", "Number(value)===1?'time':'times'", "data-i18n-aria", "queue.aria", "renderAccounts(STATUS.accounts||[])", "log.quota.refresh_success", "log.scheduler.fallback", "notice.dataset.i18nKey", "date.toLocaleString(dateLocale()", "storedLocale", "parentLocale", "window.parent.document.documentElement.lang", "watchParentLocale", "if(storedLocale())return", "attributeFilter:['lang']", "detectLocale(){return storedLocale()||parentLocale()||'en'}", `id="editSchedulerPriority"`} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("html missing marker %q: %s", want, html)
+		}
+	}
+	for _, want := range []string{".quota-fill.warn{background:#f59e0b}", "quotaFillClass", "remaining<30?'danger':remaining<60?'warn':''"} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("html missing quota color marker %q: %s", want, html)
 		}
 	}
 	for _, forbidden := range []string{"RESOURCE_ENDPOINT", "PUBLIC_STATUS_BASE", "requestPublicStatus", "metricSchedulerState", "metrics.scheduler", "/v0/resource/plugins/codex-quota-scheduler/status?action", "requestPlugin(action,options)", "details class=\"editor\"", "action_token"} {
@@ -753,6 +762,40 @@ func TestStatusHTMLStaticCardShowsDistinctPriorityBadges(t *testing.T) {
 	}
 }
 
+func TestStatusHTMLQuotaBarsUseRemainingPercentageColorBands(t *testing.T) {
+	now := time.Date(2026, 6, 21, 9, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	for _, item := range []struct {
+		id          string
+		usedPercent float64
+	}{
+		{id: "red", usedPercent: 71},    // 29% remaining.
+		{id: "orange", usedPercent: 70}, // 30% remaining.
+		{id: "green", usedPercent: 40},  // 60% remaining.
+	} {
+		account := weeklyAccount(item.id, 0, now.Add(7*24*time.Hour), false)
+		account.LastSuccessAt = now
+		account.Quota.FiveHour.UsedPercent = &item.usedPercent
+		account.Quota.LongWindow.UsedPercent = &item.usedPercent
+		store.UpsertQuota(account)
+	}
+
+	resp := HandleManagementRequest(store, pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/status"}, now)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, resp.Body)
+	}
+	html := string(resp.Body)
+	if got := strings.Count(html, `class="quota-fill danger"`); got != 2 {
+		t.Fatalf("danger quota bars = %d, want 2", got)
+	}
+	if got := strings.Count(html, `class="quota-fill warn"`); got != 2 {
+		t.Fatalf("orange quota bars = %d, want 2", got)
+	}
+	if got := strings.Count(html, `class="quota-fill "`); got != 2 {
+		t.Fatalf("green quota bars = %d, want 2", got)
+	}
+}
+
 func TestStatusPageValidatesSchedulerPriorityBeforePatch(t *testing.T) {
 	page := renderStatusPageForTest(t, NewPluginState(DefaultConfig()))
 	for _, want := range []string{
@@ -771,7 +814,9 @@ func TestStatusPageValidatesSchedulerPriorityBeforePatch(t *testing.T) {
 		t.Fatal("page still coerces invalid scheduler priority to zero")
 	}
 	validation := strings.Index(page, "if(!Number.isSafeInteger(schedulerPriority))")
-	patch := strings.Index(page, "requestManagement('/annotations/account'")
+	// Anchor on the save-account PATCH body (togglePin sends scheduler_priority:priority
+	// and needs no user-input validation).
+	patch := strings.Index(page, "scheduler_priority:schedulerPriority}")
 	if validation < 0 || patch < 0 || validation > patch {
 		t.Fatalf("scheduler priority validation must return before PATCH: validation=%d patch=%d", validation, patch)
 	}
@@ -858,17 +903,43 @@ func TestStatusPageShowsResetProbeWarningOnlyAfterProtectedLoadWhenDisabled(t *t
 	}
 }
 
+func TestManagementEnglishResetProbeCopy(t *testing.T) {
+	page := renderStatusPageForTest(t, NewPluginState(DefaultConfig()))
+	for _, want := range []string{
+		"Probe performs read-only checks at the quota refresh interval with a 30-minute minimum, even while normal refresh is dormant",
+		"sends one tiny request only after detecting a lazy reset window",
+		"This may consume a small amount of quota.",
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("English reset-probe disclosure missing %q", want)
+		}
+	}
+}
+
+func TestManagementChineseResetProbeCopy(t *testing.T) {
+	page := renderStatusPageForTest(t, NewPluginState(DefaultConfig()))
+	for _, want := range []string{
+		"即使普通刷新处于休眠状态，Probe 也会按额度刷新间隔执行只读检查，最短 30 分钟",
+		"只有检测到延迟启动的重置窗口时，才发送一次极小请求",
+		"可能消耗少量额度",
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("Chinese reset-probe disclosure missing %q", want)
+		}
+	}
+}
+
 func TestStatusPageUsesPlainChineseProbeAndMonthlyCopy(t *testing.T) {
 	page := renderStatusPageForTest(t, NewPluginState(DefaultConfig()))
 	for _, want := range []string{
 		"自动激活新的额度周期",
-		"当额度重置时间已经到达，但 OpenAI 尚未生成新的额度周期时",
+		"即使普通刷新处于休眠状态，Probe 也会按额度刷新间隔执行只读检查，最短 30 分钟",
 		"账号列表未确认时仍允许额度探测（高风险）",
 		"通常应保持关闭",
 		"月度账号使用方式",
 		"优先使用月度账号",
 		`'settings.enableResetProbe':'Enable automatic reset probe'`,
-		`'settings.enableResetProbeHelp':'When the quota reset time has arrived but OpenAI has not yet generated a new quota cycle`,
+		`'settings.enableResetProbeHelp':'Probe performs read-only checks at the quota refresh interval with a 30-minute minimum`,
 		`'settings.provisionalProbe':'Allow quota probes when the account roster is unconfirmed (high risk)'`,
 		`'settings.provisionalProbeHelp':'When CPA temporarily cannot confirm the current accounts and priorities`,
 		`'settings.monthlyMode':'Monthly mode'`,
@@ -1183,8 +1254,11 @@ func TestStatusPayloadIncludesAuthFailureVisibility(t *testing.T) {
 	if !account.AuthFailure {
 		t.Fatal("AuthFailure = false, want true")
 	}
-	if account.RefreshDueReason != "auth_failure" {
-		t.Fatalf("RefreshDueReason = %q, want auth_failure", account.RefreshDueReason)
+	// Auth failures no longer park the refresh; without a retry deadline the
+	// account simply reports the ordinary never-refreshed due reason while the
+	// AuthFailure badge above keeps the re-login hint visible.
+	if account.RefreshDueReason != "never_refreshed" {
+		t.Fatalf("RefreshDueReason = %q, want never_refreshed", account.RefreshDueReason)
 	}
 }
 
@@ -1821,6 +1895,48 @@ func TestLogsEndpointReturnsSchedulerDecision(t *testing.T) {
 	}
 }
 
+func TestManagementLogsExposeProbeLifecycleWithoutSensitiveValues(t *testing.T) {
+	now := time.Date(2026, 7, 18, 22, 59, 55, 0, time.UTC)
+	r, host, _ := newFirstObservedWeeklyLazyRuntime(t, now)
+	host.mu.Lock()
+	host.quotaStatus = http.StatusServiceUnavailable
+	host.quota = [][]byte{[]byte(`{"access_token":"access-token-sentinel","refresh_token":"refresh-token-sentinel","account_id":"account-id-sentinel","authorization":"Bearer authorization-header-sentinel","request_body":"request-body-sentinel","response_body":"response-body-sentinel"}`)}
+	host.mu.Unlock()
+	if err := r.RunProbeDueOnce(context.Background()); err == nil {
+		t.Fatal("RunProbeDueOnce returned nil error")
+	}
+
+	resp := HandleManagementRequest(r.state, pluginapi.ManagementRequest{
+		Method:  http.MethodGet,
+		Path:    "/v0/management/plugins/codex-quota-scheduler/status",
+		Headers: http.Header{"Authorization": []string{"Bearer management-key"}},
+		Query:   url.Values{"format": []string{"json"}},
+	}, now)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, resp.Body)
+	}
+	var body StatusPayload
+	if err := json.Unmarshal(resp.Body, &body); err != nil {
+		t.Fatalf("json.Unmarshal returned error: %v; body=%s", err, resp.Body)
+	}
+	if len(body.Logs) != 2 {
+		t.Fatalf("logs = %#v, want precheck and terminal failure entries", body.Logs)
+	}
+	for i, want := range []struct{ event, message string }{
+		{"probe.precheck_started", "开始检查疑似未激活的额度周期"},
+		{"probe.failed", "额度周期探测失败，已按安全策略处理"},
+	} {
+		if body.Logs[i].Event != want.event || body.Logs[i].Message != want.message {
+			t.Fatalf("log %d = %#v, want visible event/message %#v", i, body.Logs[i], want)
+		}
+	}
+	for _, forbidden := range []string{"access-token-sentinel", "refresh-token-sentinel", "account-id-sentinel", "authorization-header-sentinel", "request-body-sentinel", "response-body-sentinel"} {
+		if strings.Contains(string(resp.Body), forbidden) {
+			t.Fatalf("management status leaked %q: %s", forbidden, resp.Body)
+		}
+	}
+}
+
 func TestAnnotationsEndpointsNormalizePatchAndPersist(t *testing.T) {
 	dir := t.TempDir()
 	previousDefaultStatePath := defaultStatePath
@@ -1949,5 +2065,73 @@ func TestAnnotationsPersistenceFailureDoesNotMutateMemory(t *testing.T) {
 			}
 			tt.check(t, state)
 		})
+	}
+}
+
+// The management page ships inside the plugin binary, so an upgraded plugin
+// must not leave a browser holding a previous release's markup, scripts, and
+// validation rules. And because the page validates the retry budgets it just
+// loaded, its grammar has to accept the exact strings the API hands it.
+func TestManagementHTMLIsUncacheableAndAcceptsItsOwnRetryBudgets(t *testing.T) {
+	store := NewPluginState(DefaultConfig())
+	paths := []string{
+		managementBasePath + "/status",
+		"/v0/resource/plugins/codex-quota-scheduler/status",
+	}
+	for _, path := range paths {
+		resp := HandleManagementRequest(store, pluginapi.ManagementRequest{
+			Method: http.MethodGet,
+			Path:   path,
+		}, time.Now())
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: StatusCode = %d, want %d; body=%s", path, resp.StatusCode, http.StatusOK, resp.Body)
+		}
+		if got := resp.Headers.Get("Content-Type"); got != "text/html; charset=utf-8" {
+			t.Fatalf("%s: Content-Type = %q, want text/html", path, got)
+		}
+		if got := resp.Headers.Get("Cache-Control"); !strings.Contains(got, "no-store") {
+			t.Fatalf("%s: Cache-Control = %q, want no-store", path, got)
+		}
+		if got := resp.Headers.Get("Pragma"); got != "no-cache" {
+			t.Fatalf("%s: Pragma = %q, want no-cache", path, got)
+		}
+	}
+
+	page := string(RenderStatusHTML(BuildStatusShellPayload(time.Now())))
+
+	// The page validator accepts the seconds form that formatRetryDuration emits.
+	if !strings.Contains(page, `RETRY_DURATION_RE=/^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/i`) {
+		t.Fatalf("retry duration grammar is missing or stricter than the API output form")
+	}
+	// A bare number is read as seconds instead of being rejected.
+	if !strings.Contains(page, "function retryNormalizeDuration(") || !strings.Contains(page, "function retryDurationValue(") {
+		t.Fatalf("retry duration inputs do not normalize bare seconds")
+	}
+	// Budget fields carry unit hints so the accepted form is visible.
+	for _, want := range []string{`id="retryStallTimeout" spellcheck="false" placeholder="60s"`, `id="retryChainDeadline" spellcheck="false" placeholder="240s"`} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("retry page missing budget hint %q", want)
+		}
+	}
+	// Failures name the offending field and value instead of only the rule.
+	if !strings.Contains(page, "function retryProblemMessage(problem)") {
+		t.Fatalf("retry page does not report which budget failed")
+	}
+	for _, want := range []string{
+		`id="retryCheckCPA"`,
+		"function checkAndFixCPASettings()",
+		"function requestManagementText(",
+		"function cpaVersionAtLeast(",
+		"v7.3.4",
+		"stream-bootstrap-buffering",
+		"stream-bootstrap-timeout",
+		"bootstrap-retries",
+		"function renumberRetryFallbacks(",
+		"for(const container of document.querySelectorAll('.retryFallbacks'))",
+		"log.retry.attempt_started",
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("retry page missing implementation marker %q", want)
+		}
 	}
 }

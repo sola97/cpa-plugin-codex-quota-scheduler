@@ -171,6 +171,9 @@ func (r *QuotaRefresher) ResolveCredentialAmbiguity(ctx context.Context, roster 
 			generations[active.Instance] = TierGeneration(active.Generation)
 		}
 		r.coordinator.activateInstances(generations)
+		// The operator confirmed the external login through the UI: unpark the
+		// account and verify the new credential with one refresh.
+		r.unparkAfterExternalLogin(authID)
 	}
 	return nil
 }
@@ -220,36 +223,44 @@ type QuotaRefresher struct {
 	lifecycleOwner    *QuotaRefresher
 	lifecycleGate     func(time.Time) ActiveRoster
 
-	mu                   sync.Mutex
-	running              bool
-	startRequested       bool
-	refreshing           bool
-	stopping             bool
-	stop                 chan struct{}
-	done                 chan struct{}
-	wake                 chan struct{}
-	pendingDue           func() error
-	pendingDueVersion    uint64
-	wg                   sync.WaitGroup
-	coordinator          *Coordinator
-	legacyTxn            *LegacyRefreshTxn
-	refreshController    *RefreshController
-	probeController      *ProbeController
-	probeWAL             *ProbeWAL
-	probeFence           *FenceAllocator
-	probeRunMu           sync.Mutex
-	probeHoldMu          sync.Mutex
-	probeHoldPending     bool
-	probeHoldErr         error
-	provisionalMu        sync.Mutex
-	provisionalPermit    bool
-	fenceMu              sync.Mutex
-	nextFence            uint64
-	txnIntent            *Intent
-	txnContext           context.Context
-	txnLease             *HeldLease
-	txnPermit            func() bool
-	finalPublicationHook func()
+	mu                     sync.Mutex
+	running                bool
+	startRequested         bool
+	refreshing             bool
+	stopping               bool
+	stop                   chan struct{}
+	done                   chan struct{}
+	wake                   chan struct{}
+	pendingDue             func() error
+	pendingDueVersion      uint64
+	wg                     sync.WaitGroup
+	coordinator            *Coordinator
+	legacyTxn              *LegacyRefreshTxn
+	refreshController      *RefreshController
+	probeController        *ProbeController
+	probeWAL               *ProbeWAL
+	probeFence             *FenceAllocator
+	probeRunMu             sync.Mutex
+	probeRunStateMu        sync.Mutex
+	probeRerunPending      bool
+	probeLaunchActive      bool
+	probeRetryAt           time.Time
+	probeRetryGeneration   uint64
+	probeRecoveryPending   bool
+	probeOwnerRetryPending bool
+	probeHoldMu            sync.Mutex
+	probePersistPending    map[AuthInstanceID]struct{}
+	probeHoldPending       bool
+	probeHoldErr           error
+	provisionalMu          sync.Mutex
+	provisionalPermit      bool
+	fenceMu                sync.Mutex
+	nextFence              uint64
+	txnIntent              *Intent
+	txnContext             context.Context
+	txnLease               *HeldLease
+	txnPermit              func() bool
+	finalPublicationHook   func()
 }
 
 // NewProductionQuotaRefresher wires S2 persistence/identity primitives into
@@ -513,8 +524,11 @@ func (r *QuotaRefresher) normalBackgroundAllowed() bool {
 	roster := normalizeHostRosterLifecycle(r.enforceRosterLifecycle())
 	return normalRosterBackgroundAllowed(roster)
 }
+func (r *QuotaRefresher) resetProbeEnabled() bool {
+	return r != nil && r.state != nil && r.state.Config().EnableResetProbe
+}
 func (r *QuotaRefresher) probeBackgroundAllowed() bool {
-	if r == nil {
+	if !r.resetProbeEnabled() {
 		return false
 	}
 	if r.normalBackgroundAllowed() {
@@ -554,9 +568,27 @@ func (r *QuotaRefresher) PublishAuthoritativeRoster(ctx context.Context, roster 
 		r.rosterMu.Unlock()
 		return ErrCapabilityB
 	}
-	allowed := map[string]struct{}{}
-	for _, id := range ids {
-		allowed[id] = struct{}{}
+	admission := CPAAdmissionState{Observed: true, Priority: priority}
+	if r.state.Config().ScheduleAcrossPriorities {
+		// Admit every tier: the pick ordering prefers higher tiers, and lower
+		// tiers become reachable when higher ones are exhausted.
+		if tiers, tiered := CodexTierGroups(roster.Entries); tiered {
+			admission.Tiers = tiers
+			admission.AuthIDs = make(map[string]struct{})
+			for _, tier := range tiers {
+				for id := range tier.AuthIDs {
+					admission.AuthIDs[id] = struct{}{}
+				}
+			}
+		}
+	}
+	allowed := admission.AuthIDs
+	if allowed == nil {
+		allowed = map[string]struct{}{}
+		for _, id := range ids {
+			allowed[id] = struct{}{}
+		}
+		admission.AuthIDs = allowed
 	}
 	filtered := roster
 	filtered.Entries = nil
@@ -575,7 +607,7 @@ func (r *QuotaRefresher) PublishAuthoritativeRoster(ctx context.Context, roster 
 		previousBindings[authID] = binding
 	}
 	r.bindings.mu.RUnlock()
-	reconciled, err := r.bindings.ReconcileRoster(ctx, filtered, bootstrapHost)
+	reconciled, err := r.bindings.ReconcileRosterTiers(ctx, filtered, bootstrapHost)
 	if err != nil {
 		return err
 	}
@@ -636,7 +668,7 @@ func (r *QuotaRefresher) PublishAuthoritativeRoster(ctx context.Context, roster 
 	}
 	owner := r.lifecycleRefresher()
 	owner.rosterAdmissionMu.Lock()
-	r.state.ReplaceCPAAdmission(CPAAdmissionState{Observed: true, Priority: priority, AuthIDs: allowed})
+	r.state.ReplaceCPAAdmission(admission)
 	if r.finalPublicationHook != nil {
 		r.finalPublicationHook()
 	}
@@ -655,6 +687,24 @@ func (r *QuotaRefresher) PublishAuthoritativeRoster(ctx context.Context, roster 
 		r.Start()
 	}
 	return nil
+}
+
+// unparkAfterExternalLogin re-admits an account whose credentials were
+// replaced by an operator re-login (confirmed through the credential
+// reconcile). Clearing the auth-failure flag returns the account to the
+// refresh pool; the immediately triggered single-account refresh supplies the
+// quota evidence scheduling still requires before the account becomes
+// selectable again. A failed verification simply re-parks the account.
+func (r *QuotaRefresher) unparkAfterExternalLogin(authID string) {
+	if r == nil || r.state == nil || authID == "" {
+		return
+	}
+	if !r.state.ClearAccountAuthFailure(authID) {
+		return
+	}
+	r.state.RecordLog("info", "credential.external_login_unparked", "检测到账号重新登录，已解除认证异常停机并触发验证刷新", map[string]any{"auth_id": authID}, r.now())
+	publishSchedulerState(r.state, highestTierSet(r.runtimeRoster()), r.now())
+	r.RefreshOneSoon(authID)
 }
 
 func (r *QuotaRefresher) reconcileActiveCredentialTails(ctx context.Context, bindings map[string]RuntimeBinding, freshlyObserved map[string]struct{}) {
@@ -713,6 +763,9 @@ func (r *QuotaRefresher) reconcileActiveCredentialTails(ctx context.Context, bin
 			if ok && r.coordinator != nil {
 				r.coordinator.activateInstances(map[AuthInstanceID]TierGeneration{current.Instance: TierGeneration(current.Generation)})
 			}
+			// The binding accepted the re-login; carry the account out of its
+			// auth-failure park and verify the new credential with one refresh.
+			r.unparkAfterExternalLogin(authID)
 		}
 	}
 }
@@ -834,6 +887,8 @@ func NewQuotaRefresher(host HostClient, state *PluginState, now func() time.Time
 			}
 			if err := r.bootstrapProbeWindows(); err != nil {
 				r.state.RecordLog("warn", "probe.bootstrap_failed", "Probe 状态初始化失败，将在下次刷新重试", map[string]any{"auth_id": intent.AuthID, "error": redactSecrets(err.Error())}, r.now())
+			} else if r.probeController != nil && hasPendingProbeWindows(r.probeController.Snapshot()) {
+				r.launchProbe(false)
 			}
 			return nil
 		},
@@ -851,7 +906,16 @@ func NewQuotaRefresher(host HostClient, state *PluginState, now func() time.Time
 		},
 		InheritSentUnknown: func(intent Intent, suppressUntil time.Time) error {
 			if (intent.Class == OperationProbeSend || intent.Class == OperationProbeSequence) && r.probeWAL != nil {
-				return r.probeWAL.PersistSentUnknown(intent.Instance, suppressUntil)
+				r.probeHoldMu.Lock()
+				defer r.probeHoldMu.Unlock()
+				if err := r.probeWAL.PersistSentUnknown(intent.Instance, intent.AttemptID, suppressUntil); err != nil {
+					return err
+				}
+				persisted, err := r.runtimeStore.PersistentSnapshot()
+				if err == nil {
+					r.syncProbeControllerInstance(intent.Instance, persisted)
+				}
+				return err
 			}
 			return r.persistLegacySentUnknown(intent, suppressUntil)
 		},
@@ -967,7 +1031,7 @@ func (r *QuotaRefresher) RefreshDueCandidatesOnce(req pluginapi.SchedulerPickReq
 	}
 	_, version := r.state.CPAAdmissionVersioned()
 	if r.runtimeStore == nil {
-		if admission, ok := HighestPriorityCodexAdmission(req); ok {
+		if admission, ok := CodexAdmissionFromRequest(req, r.state.Config().ScheduleAcrossPriorities); ok {
 			version = r.state.ReplaceCPAAdmission(admission)
 		}
 	}
@@ -1128,15 +1192,91 @@ func (r *QuotaRefresher) refreshOneAuthIDVersioned(authID string, version uint64
 			continue
 		}
 		if !isRefreshEligible(auth) {
-			return fmt.Errorf("auth %s is not eligible for quota refresh", authID)
+			// An explicit operator action may override host-side Disabled or
+			// Unavailable cooldown flags (for example after a manual upstream
+			// quota reset) but never the structural requirements.
+			if !isManualRefreshCandidate(auth) {
+				return fmt.Errorf("auth %s is not eligible for quota refresh", authID)
+			}
+			r.recordAdmissionLog(authID, version, "warn", "quota.manual_refresh_override", "手动刷新已越过宿主侧的禁用或不可用标记", map[string]any{"auth_id": authID})
 		}
 		r.refreshAuthVersionedSource(auth, version, SourceManualRefresh)
+		r.reconcileTemporaryExhausted(authID, version)
 		return nil
 	}
 	if !r.state.BeginCPAAdmissionCall(authID, version) {
 		return errCPAAdmissionChanged
 	}
 	return fmt.Errorf("auth %s not found", authID)
+}
+
+// isManualRefreshCandidate keeps the structural requirements for an explicit
+// operator-requested refresh while tolerating host-side Disabled or Unavailable
+// cooldown flags that a manual upstream reset may have left behind.
+func isManualRefreshCandidate(auth pluginapi.HostAuthFileEntry) bool {
+	return strings.EqualFold(auth.Provider, "codex") && auth.AuthIndex != ""
+}
+
+// reconcileTemporaryExhausted clears a stale temporary-exhaustion marker after
+// an operator-requested refresh produced a fresh quota snapshot whose known
+// windows all show remaining capacity. Generic quota percentages alone never
+// clear the marker during background refresh (issue #11's K12 negative control
+// observed accounts reporting 100% while model requests still hit upstream
+// 429); reconciliation runs only on the manual per-account path, where the
+// operator has confirmed an upstream reset, and on real request success.
+func (r *QuotaRefresher) reconcileTemporaryExhausted(authID string, version uint64) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	now := r.now()
+	for _, account := range r.state.Snapshot(now).Accounts {
+		if account.AuthID != authID || !account.TemporaryExhausted {
+			continue
+		}
+		if !quotaSnapshotShowsRecovery(account.Quota, now) {
+			continue
+		}
+		if !r.state.BeginCPAAdmissionCall(authID, version) {
+			return
+		}
+		if r.state.ClearAccountTemporaryExhausted(authID) {
+			r.recordAdmissionLog(authID, version, "info", "quota.temporary_recovered", "手动刷新证实额度已恢复，已清除临时耗尽标记", map[string]any{"auth_id": authID})
+			publishSchedulerState(r.state, highestTierSet(r.runtimeRoster()), r.now())
+		}
+		return
+	}
+}
+
+// quotaSnapshotShowsRecovery reports whether a fresh quota read proves usable
+// capacity. Every known window must be non-exhausted with remaining capacity;
+// at least one window must be known. Missing windows are treated as absent
+// evidence rather than recovery.
+func quotaSnapshotShowsRecovery(quota ParsedQuota, now time.Time) bool {
+	known := false
+	for _, window := range []*QuotaWindow{quota.FiveHour, quota.LongWindow} {
+		if window == nil {
+			continue
+		}
+		known = true
+		if !windowShowsRemainingCapacity(window, now) {
+			return false
+		}
+	}
+	return known
+}
+
+func windowShowsRemainingCapacity(window *QuotaWindow, now time.Time) bool {
+	if window == nil {
+		return false
+	}
+	if window.Exhausted && (window.ResetAt.IsZero() || window.ResetAt.After(now)) {
+		return false
+	}
+	if window.UsedPercent != nil {
+		return 100-*window.UsedPercent > 0
+	}
+	return true
 }
 
 func (r *QuotaRefresher) RefreshOneSoon(authID string) {
@@ -1172,12 +1312,16 @@ func (r *QuotaRefresher) Start() {
 	r.mu.Lock()
 	r.startRequested = true
 	r.mu.Unlock()
-	if !r.normalBackgroundAllowed() && !r.probeBackgroundAllowed() && !r.provisionalProbeRiskConfigured() {
+	if !r.normalBackgroundAllowed() && !r.probeBackgroundAllowed() && !(r.resetProbeEnabled() && r.provisionalProbeRiskConfigured()) {
 		return
 	}
 	r.mu.Lock()
 	if r.running {
 		r.mu.Unlock()
+		if r.probeController != nil && r.resetProbeEnabled() && hasPendingProbeWindows(r.probeController.Snapshot()) {
+			r.launchProbe(false)
+		}
+		r.wakeRefreshLoop()
 		return
 	}
 	stop := make(chan struct{})
@@ -1189,7 +1333,7 @@ func (r *QuotaRefresher) Start() {
 	r.running = true
 	r.stopping = false
 	r.mu.Unlock()
-	if r.probeController != nil {
+	if r.probeController != nil && r.resetProbeEnabled() {
 		r.launchProbe(true)
 	}
 
@@ -1211,10 +1355,18 @@ func (r *QuotaRefresher) Start() {
 			}
 			select {
 			case <-timerC:
+				// Managed-quota recovery runs before normal deadlines so
+				// disabled accounts return as soon as their quota recovers,
+				// even while normal refresh is dormant. It routes to the
+				// lifecycle owner, which owns the production runtime store.
+				func() {
+					owner := r.lifecycleRefresher()
+					_ = owner.RecoverManagedQuotaAccounts(context.Background())
+				}()
 				r.refreshController.OnDeadline(r.now())
 				r.RefreshDueSoon()
 				if r.probeController != nil {
-					r.launchProbe(false)
+					r.launchProbeFromTimer(false)
 				}
 			case <-wake:
 				if timer != nil && !timer.Stop() {
@@ -1236,33 +1388,208 @@ func (r *QuotaRefresher) Start() {
 	}()
 }
 
+func hasPendingProbeWindows(windows map[AuthInstanceID]map[ProbeWindowKind]ProbeWindow) bool {
+	for _, instanceWindows := range windows {
+		for _, window := range instanceWindows {
+			if window.State == ProbePendingCheck {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (r *QuotaRefresher) launchProbe(recoverFirst bool) {
+	r.launchProbeWithAdmission(recoverFirst, false)
+}
+
+func (r *QuotaRefresher) launchProbeFromTimer(recoverFirst bool) {
+	r.launchProbeWithAdmission(recoverFirst, true)
+}
+
+func (r *QuotaRefresher) launchProbeWithAdmission(recoverFirst, timerAdmission bool) {
+	if !r.resetProbeEnabled() {
+		return
+	}
+	now := r.now()
 	r.mu.Lock()
 	if r.stopping {
 		r.mu.Unlock()
 		return
 	}
+	r.probeRunStateMu.Lock()
+	if r.probeLaunchActive {
+		r.probeRerunPending = true
+		if recoverFirst {
+			r.probeRecoveryPending = true
+		}
+		r.probeRunStateMu.Unlock()
+		r.mu.Unlock()
+		return
+	}
+	retryDue := !r.probeRetryAt.IsZero() && !now.Before(r.probeRetryAt)
+	if !r.probeRetryAt.IsZero() && (!timerAdmission || !retryDue) {
+		if recoverFirst {
+			r.probeRecoveryPending = true
+		}
+		r.probeRunStateMu.Unlock()
+		r.mu.Unlock()
+		return
+	}
+	if timerAdmission && retryDue {
+		r.probeOwnerRetryPending = false
+	}
+	launchGeneration := r.probeRetryGeneration
+	recoverFirst = recoverFirst || r.probeRecoveryPending
+	if recoverFirst {
+		r.probeRecoveryPending = false
+	}
+	r.probeLaunchActive = true
+	r.probeRunStateMu.Unlock()
 	r.wg.Add(1)
 	r.mu.Unlock()
 	go func() {
-		defer r.wg.Done()
-		if recoverFirst {
-			_ = r.RunProbeRecoveryOnce(context.Background())
+		defer func() {
+			r.wakeRefreshLoop()
+			r.wg.Done()
+		}()
+		for {
+			var firstErr error
+			var recoveryErr error
+			recoveryOwned := true
+			var dueOwned bool
+			if recoverFirst {
+				recoveryOwned, recoveryErr = r.runProbeRecoveryOnceAdmitted(context.Background(), launchGeneration)
+				firstErr = recoveryErr
+			}
+			var dueErr error
+			if recoveryErr == nil && recoveryOwned {
+				dueOwned, dueErr = r.runProbeDueOnceAdmitted(context.Background(), launchGeneration)
+				if firstErr == nil {
+					firstErr = dueErr
+				}
+			}
+			recoveryRequired := dueErr != nil
+			if firstErr == nil && dueOwned {
+				var checkErr error
+				recoveryRequired, checkErr = r.hasDurableNonterminalProbeAttempts()
+				if checkErr != nil {
+					firstErr = checkErr
+					recoveryRequired = true
+				}
+			}
+			rerun, recoverNext := r.finishProbeLaunch(firstErr, recoverFirst, recoveryErr, dueOwned, recoveryRequired, launchGeneration)
+			if !rerun {
+				return
+			}
+			recoverFirst = recoverNext
 		}
-		_ = r.RunProbeDueOnce(context.Background())
 	}()
+}
+
+func (r *QuotaRefresher) hasDurableNonterminalProbeAttempts() (bool, error) {
+	if r.runtimeStore == nil {
+		return false, nil
+	}
+	state, err := r.runtimeStore.PersistentSnapshot()
+	if err != nil {
+		return false, err
+	}
+	for _, attempt := range state.ProbeAttempts {
+		if nonterminalProbeAttempt(attempt) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *QuotaRefresher) probeLaunchAdmissionCurrentLocked(generation uint64) bool {
+	return r.probeRetryGeneration == generation && !r.probeOwnerRetryPending
+}
+
+func (r *QuotaRefresher) publishProbeRetryLocked(now time.Time, owner bool) {
+	r.probeRetryGeneration++
+	r.probeRetryAt = now.Add(probeBackoff(1))
+	if owner {
+		r.probeOwnerRetryPending = true
+	}
+}
+
+func (r *QuotaRefresher) finishProbeLaunch(runErr error, recoveryAttempted bool, recoveryErr error, dueOwned bool, recoveryRequired bool, launchGeneration uint64) (bool, bool) {
+	now := r.now()
+	r.probeRunStateMu.Lock()
+	if (recoveryAttempted && recoveryErr != nil) || recoveryRequired {
+		r.probeRecoveryPending = true
+	}
+	newerRetry := r.probeRetryGeneration != launchGeneration
+	if runErr != nil || recoveryRequired || r.probeOwnerRetryPending || newerRetry {
+		if (runErr != nil || recoveryRequired) && !r.probeOwnerRetryPending && !newerRetry {
+			r.publishProbeRetryLocked(now, false)
+		}
+		r.probeRerunPending = false
+		r.probeLaunchActive = false
+		r.probeRunStateMu.Unlock()
+		return false, false
+	} else {
+		r.probeRetryAt = time.Time{}
+	}
+	if !dueOwned && (!r.probeRerunPending || !r.probeRunMu.TryLock()) {
+		r.probeLaunchActive = false
+		r.probeRunStateMu.Unlock()
+		return false, false
+	}
+	if !dueOwned {
+		r.probeRunMu.Unlock()
+	}
+	if r.probeRerunPending {
+		r.probeRerunPending = false
+		recoverNext := r.probeRecoveryPending
+		r.probeRecoveryPending = false
+		r.probeRunStateMu.Unlock()
+		return true, recoverNext
+	}
+	r.probeLaunchActive = false
+	r.probeRunStateMu.Unlock()
+	return false, false
 }
 
 func (r *QuotaRefresher) nextRefreshLoopDelay() (time.Duration, bool) {
 	now := r.now()
 	deadline := r.refreshController.NextDeadline(now)
-	if r.probeController != nil {
-		if probe := r.probeController.NextDeadline(); !probe.IsZero() && (deadline.IsZero() || probe.Before(deadline)) {
+	if r.probeController != nil && r.resetProbeEnabled() {
+		r.probeRunStateMu.Lock()
+		launchActive := r.probeLaunchActive
+		probeRetryAt := r.probeRetryAt
+		r.probeRunStateMu.Unlock()
+		probe := time.Time{}
+		if !launchActive && !probeRetryAt.IsZero() {
+			probe = probeRetryAt
+		} else if !launchActive {
+			probe = r.probeController.NextDeadline()
+		}
+		// Durable recoverable probe attempts (ambiguous sends persisted in the
+		// WAL) are their own wake source: their in-memory window states carry
+		// no NextDeadline entry, so a future VerifyNotBefore must be able to
+		// wake an otherwise idle loop. Only future deadlines contribute —
+		// already-due attempts are handled by the launch loop's own recovery
+		// pass, the error backoff, or startup recovery, and must not trigger
+		// an immediate relaunch here.
+		if !launchActive && probeRetryAt.IsZero() && r.probeWAL != nil {
+			if recoveryDue, ok := r.probeWAL.RecoveryDeadline(); ok && recoveryDue.After(now) {
+				if probe.IsZero() || recoveryDue.Before(probe) {
+					probe = recoveryDue
+				}
+			}
+		}
+		if !probe.IsZero() && (deadline.IsZero() || probe.Before(deadline)) {
 			deadline = probe
 		}
 	}
 	if legacy := r.state.NextRefreshDueAt(now); !legacy.IsZero() && (deadline.IsZero() || legacy.Before(deadline)) {
 		deadline = legacy
+	}
+	if managed := r.managedRecoveryDeadline(now); !managed.IsZero() && (deadline.IsZero() || managed.Before(deadline)) {
+		deadline = managed
 	}
 	if deadline.IsZero() {
 		return 0, false
@@ -1646,6 +1973,16 @@ func (r *QuotaRefresher) doBackgroundHTTPRequest(req pluginapi.HTTPRequest, prob
 		return pluginapi.HTTPResponse{}, ErrCapabilityB
 	}
 	defer owner.rosterMu.RUnlock()
+	if owner.state == nil && probe {
+		return pluginapi.HTTPResponse{}, ErrCapabilityB
+	}
+	if owner.state != nil && (probe || roster.Provisional) {
+		owner.state.mu.RLock()
+		defer owner.state.mu.RUnlock()
+		if probe && !owner.state.cfg.EnableResetProbe {
+			return pluginapi.HTTPResponse{}, ErrCapabilityB
+		}
+	}
 	allowed := normalRosterBackgroundAllowed(roster)
 	if probe {
 		allowed = allowed || provisionalProbeBackgroundAllowed(roster)
@@ -1654,8 +1991,6 @@ func (r *QuotaRefresher) doBackgroundHTTPRequest(req pluginapi.HTTPRequest, prob
 		if owner.state == nil {
 			return pluginapi.HTTPResponse{}, ErrCapabilityB
 		}
-		owner.state.mu.RLock()
-		defer owner.state.mu.RUnlock()
 		if !owner.state.cfg.ProbeOnProvisionalRoster || !provisionalAgeValid(owner.now(), roster.ConfirmedAt) {
 			allowed = false
 		}
@@ -2034,6 +2369,65 @@ func sanitizedBodySummary(body []byte) string {
 		summary = summary[:maxErrorBodySummaryLen] + "..."
 	}
 	return summary
+}
+
+func sanitizedProbeResponseSummary(body []byte) string {
+	if len(body) == 0 {
+		return "<empty>"
+	}
+	var value any
+	if err := json.Unmarshal(body, &value); err != nil {
+		return fmt.Sprintf("<non-json response body: %d bytes>", len(body))
+	}
+	safe := probeDiagnosticValue(value)
+	if safe == nil {
+		return "<json response without diagnostic fields>"
+	}
+	encoded, err := json.Marshal(safe)
+	if err != nil {
+		return "<unavailable>"
+	}
+	summary := redactSecrets(string(encoded))
+	if len(summary) > maxErrorBodySummaryLen {
+		summary = summary[:maxErrorBodySummaryLen] + "..."
+	}
+	return summary
+}
+
+func probeDiagnosticValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any)
+		for key, child := range typed {
+			switch strings.ToLower(key) {
+			case "error", "type", "code", "message", "detail", "title", "status", "param":
+				if sanitized := probeDiagnosticValue(child); sanitized != nil {
+					out[key] = sanitized
+				}
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(typed))
+		for _, child := range typed {
+			if sanitized := probeDiagnosticValue(child); sanitized != nil {
+				out = append(out, sanitized)
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	case string:
+		return redactSecrets(typed)
+	case float64, bool, nil:
+		return typed
+	default:
+		return nil
+	}
 }
 
 func (ABIHostClient) ListAuths() ([]pluginapi.HostAuthFileEntry, error) {

@@ -8,9 +8,9 @@ import (
 const (
 	resetProbeAfterResetDelay = 10 * time.Minute
 	resetProbeCloseThreshold  = 3 * time.Minute
-	codexResetProbeEndpoint   = "https://chatgpt.com/backend-api/codex/responses/compact"
-	codexResetProbeModel      = "gpt-5.4-mini"
-	resetProbePayload         = `{"model":"gpt-5.4-mini","instructions":"","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}]}`
+	codexResetProbeEndpoint   = "https://chatgpt.com/backend-api/codex/responses"
+	codexResetProbeModel      = "gpt-5.6-luna"
+	resetProbePayload         = `{"model":"gpt-5.6-luna","instructions":"","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"stream":true,"store":false}`
 )
 
 func probeWindowDuration(window QuotaWindow) (time.Duration, bool) {
@@ -25,6 +25,17 @@ func probeWindowDuration(window QuotaWindow) (time.Duration, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func firstObservationLazyWindow(now time.Time, window QuotaWindow) (time.Duration, bool) {
+	if window.UsedPercent == nil || *window.UsedPercent != 0 || window.ResetAt.IsZero() {
+		return 0, false
+	}
+	duration, ok := probeWindowDuration(window)
+	if !ok || duration <= 0 {
+		return 0, false
+	}
+	return duration, absDuration(window.ResetAt.Sub(now.Add(duration))) <= resetProbeCloseThreshold
 }
 
 func scheduleResetProbesFromPrevious(previous AccountState, current map[WindowKind]ResetProbeState, now time.Time) map[WindowKind]ResetProbeState {
