@@ -14,9 +14,9 @@
 - [x] Explain unknown quota, missing/nonweekly windows, base disabled, unmatched time rules, selected thresholds and blocked/allowed comparisons.
 - [x] Capture diagnostics at pick time, retaining async log correctness through concurrent config updates.
 - [x] Run full Go tests, focused race, vet, build, and rendered UI checks.
-- [ ] Commit feat(quota): add account protection switches and Chinese decision logs, then push main.
-- [ ] Back up and deploy to NUC, recreating main CPA together with its TUIC client sidecar, never pulling replacement images.
-- [ ] Verify default-off state, successful quota refresh, saved settings across recreation, and absence of synthetic test records.
+- [x] Commit feat(quota): add account protection switches and Chinese decision logs, then push main.
+- [x] Back up and deploy to NUC, recreating main CPA together with its TUIC client sidecar, never pulling replacement images.
+- [x] Verify default-off state, successful quota refresh, saved settings across recreation, and absence of synthetic test records.
 
 ## Verification Evidence
 
@@ -27,3 +27,14 @@
 - Disabled cards do not imply a live 0% reserve; enabled cards separately show each window's current and base percentages. Zero bases, unknown quota and monthly/nonweekly windows have explicit labels.
 - Chinese saved-account and protection-reason logs render correctly; browser console has no errors or warnings.
 - Temporary browser harness removed before committing.
+
+## Deployment Evidence
+
+- Feature commit `92872d8` pushed to origin/main and loaded on NUC as `0.3.2-sola97.92872d8`.
+- Installed Linux amd64 library SHA256: `082e46fd5683b750743da03bc26a9f21e4be3c490aabd4b10bf33599adf3ba06`.
+- Backup: `/home/ubuntu/docker-cpa/backups/quota-toggle-20261012T115720Z`, including previous library, config, compose, and persistent plugin state.
+- Main CPA and its TUIC client recreated together with `--pull never`; network namespace linkage checked. No proxy endpoint, image, config or compose changes.
+- A nonexistent-account marker with an enabled switch and custom window rules survived another paired container recreation; marker removed afterward. Real annotation and settings digests matched their pre-upgrade baselines.
+- Three real accounts loaded successfully and three quota refresh success events observed. Two accounts available; one remains unavailable because its 5-hour quota is exhausted, matching its pre-upgrade state.
+- Real account rules preserved: switches off, base reserves unchanged at 0%. No real account protection enabled by the deployment.
+- All three existing plugins registered; main CPA and TUIC client running with restart policy `always`.
