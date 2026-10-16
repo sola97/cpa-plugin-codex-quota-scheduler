@@ -142,7 +142,8 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
-	if pump := globalPickActivityPump.Load(); pump != nil {
+	pump := globalPickActivityPump.Load()
+	if pump != nil {
 		ctx, cancel := context.WithTimeout(pump.ctx, schedulerQuotaWaitTimeout)
 		err := waitForSchedulerQuota(ctx, req, pump)
 		cancel()
@@ -154,7 +155,10 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	}
 	decision := schedulerPickPublished(req, time.Now())
 	if decision.Reject {
-		return errorEnvelope("quota_reserve_protected", "没有可选的 Codex 账号；额度保留保护已阻止内置调度回退"), nil
+		if pump == nil && schedulerQuotaPending(publishedSchedulerSnapshot.Load(), req, time.Now()) {
+			return quotaNotReadyEnvelope()
+		}
+		return quotaLimitEnvelope(decision.UnavailableSummary)
 	}
 	return okEnvelope(pluginapi.SchedulerPickResponse{
 		AuthID:          decision.AuthID,

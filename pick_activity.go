@@ -30,6 +30,7 @@ type pickActivityPump struct {
 	observations     chan pickObservationIntent
 	observationDone  chan struct{}
 	observationDrops atomic.Uint64
+	activityRevision atomic.Uint64
 	stopped          atomic.Bool
 	stopOnce         sync.Once
 	roster           *RosterController
@@ -109,7 +110,11 @@ func (p *pickActivityPump) run() {
 					break
 				}
 				if p.roster != nil {
-					_, _ = p.roster.WakeForActivity(p.ctx)
+					if !p.roster.Snapshot().Confirmed {
+						_, _ = p.roster.WakeForManagement(p.ctx)
+					} else {
+						_, _ = p.roster.WakeForActivity(p.ctx)
+					}
 				}
 				if p.ctx.Err() != nil {
 					return
@@ -119,6 +124,7 @@ func (p *pickActivityPump) run() {
 					_, version := p.state.CPAAdmissionVersioned()
 					p.refresher.OnSchedulerPick(intent.Request, version, intent.Now)
 				}
+				p.activityRevision.Add(1)
 			}
 		}
 	}

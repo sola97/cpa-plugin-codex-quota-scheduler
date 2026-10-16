@@ -2,11 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
 	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -177,12 +179,18 @@ func TestQuotaReservePublishedPickCannotFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var env envelope
+	var env pluginabi.Envelope
 	if err := json.Unmarshal(response, &env); err != nil {
 		t.Fatal(err)
 	}
-	if env.OK || env.Error == nil || env.Error.Code != "quota_reserve_protected" {
+	if env.OK || env.Error == nil || env.Error.Code != "usage_limit_reached" || env.Error.HTTPStatus != http.StatusTooManyRequests {
 		t.Fatalf("ABI must reject rather than return an empty success: %s", response)
+	}
+	var body struct {
+		Error struct{ Message, Type, Code string }
+	}
+	if json.Unmarshal([]byte(env.Error.Message), &body) != nil || body.Error.Message != "You've hit your 5-hour usage limit." || body.Error.Type != "usage_limit_reached" || body.Error.Code != "usage_limit_reached" {
+		t.Fatalf("downstream usage-limit payload was not preserved: %s", response)
 	}
 	// Even before the roster/quota loads, saved protection forbids fallback.
 	state.Accounts = nil
@@ -190,6 +198,13 @@ func TestQuotaReservePublishedPickCannotFallback(t *testing.T) {
 	PublishSchedulerSnapshot(schedulerSnapshotFromState(state, NewTrialRegistry()))
 	if decision := schedulerPickPublished(req, now); !decision.Reject {
 		t.Fatalf("unloaded protected account bypasses reserve: %#v", decision)
+	}
+	response, err = handleSchedulerPick(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if json.Unmarshal(response, &env) != nil || env.Error == nil || env.Error.Code != "quota_not_ready" || env.Error.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("missing refresh service must not report exhausted quota: %s", response)
 	}
 	state.Annotations = AnnotationState{Accounts: map[string]AccountAnnotation{"instance:1": a.Annotation}}
 	PublishSchedulerSnapshot(schedulerSnapshotFromState(state, NewTrialRegistry()))

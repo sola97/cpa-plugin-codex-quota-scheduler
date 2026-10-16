@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -24,6 +25,7 @@ func waitForSchedulerQuota(ctx context.Context, req pluginapi.SchedulerPickReque
 		return fmt.Errorf("额度刷新服务不可用")
 	}
 	pump.state.RecordLog("info", "scheduler.quota_wait", "账号额度尚未就绪，正在查询额度；原请求等待刷新后继续调度", map[string]any{"model": req.Model, "candidate_count": codexCandidateCount(req)}, time.Now())
+	activityRevision := pump.activityRevision.Load()
 	pump.enqueue(req, snapshot.AdmissionVersion, time.Now())
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
@@ -32,8 +34,10 @@ func waitForSchedulerQuota(ctx context.Context, req pluginapi.SchedulerPickReque
 		if !schedulerQuotaPending(current, req, time.Now()) {
 			return nil
 		}
-		if err := schedulerQuotaRefreshFailure(pump, req, current.AdmissionVersion); err != nil {
-			return err
+		if pump.activityRevision.Load() != activityRevision {
+			if err := schedulerQuotaRefreshFailure(pump, req, current.AdmissionVersion); err != nil {
+				return err
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -125,6 +129,26 @@ func schedulerQuotaRefreshFailure(pump *pickActivityPump, req pluginapi.Schedule
 
 func quotaNotReadyEnvelope() ([]byte, error) {
 	return json.Marshal(pluginabi.Envelope{OK: false, Error: &pluginabi.Error{
-		Code: "quota_not_ready", Message: "账号额度尚未就绪，额度查询失败或等待超时，请稍后重试", Retryable: true, HTTPStatus: http.StatusServiceUnavailable,
+		Code: "quota_not_ready", Message: `{"error":{"message":"账号额度尚未就绪，额度查询失败或等待超时，请稍后重试","type":"server_error","code":"quota_not_ready","retryable":true}}`, Retryable: true, HTTPStatus: http.StatusServiceUnavailable,
 	}})
+}
+
+func quotaLimitEnvelope(summary string) ([]byte, error) {
+	message := "No account is currently available under the configured quota protection."
+	fiveHour := strings.Contains(summary, "five_hour_reserved")
+	weekly := strings.Contains(summary, "weekly_reserved")
+	if fiveHour && !weekly {
+		message = "You've hit your 5-hour usage limit."
+	} else if weekly && !fiveHour {
+		message = "You've hit your weekly usage limit."
+	} else if fiveHour && weekly {
+		message = "You've hit your 5-hour or weekly usage limit."
+	}
+	body, err := json.Marshal(map[string]any{"error": map[string]string{
+		"message": message, "type": "usage_limit_reached", "code": "usage_limit_reached",
+	}})
+	if err != nil {
+		return nil, err
+	}
+	return pluginabi.NewErrorEnvelope("usage_limit_reached", string(body), http.StatusTooManyRequests)
 }

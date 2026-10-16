@@ -36,5 +36,19 @@
 
 - [x] Document the 15-second wait, read-only usage lookup, unchanged original model, separate activation probes, and 503 failure behavior.
 - [x] Run `go test ./...`, `go vet ./...` and a Windows dynamic-library build. All passed; the final complete race suite also passed after moving the new tests onto production runtime bindings.
-- [ ] Inspect the final diff, commit only task files with `fix(scheduler): wait for quota readiness before rejecting requests`, and push `origin/main`.
+- [x] Inspect the final diff, commit only task files with `fix(scheduler): wait for quota readiness before rejecting requests`, and push `origin/main` (9f3e11c).
 - [x] Live deployment is outside this change: no NUC/Bandwagon settings or installed libraries were changed. Host HTTP end-to-end status propagation and upstream connectivity still need live verification after deployment.
+
+### Task 3: Downstream Error Contract And Dual-Host Deployment
+
+**Goal:** User's final follow-up prefers semantic HTTP 429 (superseding 402) with `usage_limit_reached` in both type and code. Use `You've hit your 5-hour usage limit.` for 5h reserve rejection and matching weekly/mixed text for other windows. Preserve the separate retryable 503 readiness error.
+
+**Files:** Modify `dispatch.go`, `scheduler_readiness.go`, `quota_reserve_test.go`, `scheduler_readiness_test.go`, `README.zh-CN.md`; deployment helpers live outside the repository under the current task's `work` directory.
+
+- [x] Update ABI contract tests and demonstrate failure against the prior response.
+- [x] Return a structured OpenAI error as the ABI error message so CPA preserves the public type/code, plus the SDK HTTP status field.
+- [x] Fix startup empty-roster caching and failure checks racing the activity pump. Add a gated authoritative-roster regression; preserve safe refusal when roster confirmation truly fails and 503 when the refresh service is unavailable.
+- [x] Run focused and full Linux tests, race checks and vet; build a versioned Linux shared library using the existing WSL Go 1.26 compiler. All passed after the final startup fix.
+- [x] Verify the actual HTTP error contract in a disposable CPA v8.0.31 container with synthetic account data, without modifying live account reserves. Cold first requests returned 429/5-hour (0.534s), 429/weekly (0.526s), and 503/quota_not_ready (0.264s). Synthetic host HTTP responses never reached a model or real account.
+- [ ] Back up each installed library, verify configuration/rule digests, atomically install on NUC and restart CPA with its TUIC sidecar. Use the existing five-minute single-direction synchronizer to deploy the exact same library to Bandwagon, preserving target connection settings.
+- [ ] Read both hosts' plugin registration, account state and request logs; verify cold-start recovery and persistence without printing credentials. Record deployment evidence, commit and push task files.

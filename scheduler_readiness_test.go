@@ -109,8 +109,49 @@ func TestSchedulerQuotaActualReserveStillRejectsAfterRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	var result envelope
-	if json.Unmarshal(response, &result) != nil || result.Error == nil || result.Error.Code != "quota_reserve_protected" {
+	if json.Unmarshal(response, &result) != nil || result.Error == nil || result.Error.Code != "usage_limit_reached" {
 		t.Fatalf("actual reserve must still reject: %s", response)
+	}
+}
+
+func TestSchedulerQuotaRecoversStartupEmptyRosterBeforeFailureCheck(t *testing.T) {
+	host, _, pump, req := readinessFixture(t, 95)
+	_, _ = pump.roster.OnSyncResult(context.Background(), nil, errors.New("CPA is still loading credentials"))
+	rosterHost := pump.roster.host.(*s7RosterHost)
+	rosterHost.entered = make(chan struct{})
+	rosterHost.release = make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-rosterHost.release:
+		default:
+			close(rosterHost.release)
+		}
+	})
+	raw, _ := json.Marshal(req)
+	done := make(chan []byte, 1)
+	go func() { response, _ := handleSchedulerPick(raw); done <- response }()
+	select {
+	case <-rosterHost.entered:
+	case response := <-done:
+		t.Fatalf("cached startup roster failure rejected before resync: %s", response)
+	case <-time.After(time.Second):
+		t.Fatal("request did not recheck the authoritative roster")
+	}
+	select {
+	case response := <-done:
+		t.Fatalf("request rejected while roster confirmation was in flight: %s", response)
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(rosterHost.release)
+	close(host.releaseDo)
+	select {
+	case response := <-done:
+		var result pluginabi.Envelope
+		if json.Unmarshal(response, &result) != nil || result.Error == nil || result.Error.HTTPStatus != http.StatusTooManyRequests {
+			t.Fatalf("refreshed quota must determine the original response: %s", response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("original request did not resume after roster and quota refresh")
 	}
 }
 
@@ -268,5 +309,67 @@ func TestSchedulerQuotaShutdownReleasesWaiters(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("shutdown left a request waiting")
+	}
+}
+
+func TestQuotaLimitEnvelopeUsesMatchingWindow(t *testing.T) {
+	tests := []struct {
+		summary string
+		message string
+	}{
+		{"five_hour_reserved", "You've hit your 5-hour usage limit."},
+		{"weekly_reserved", "You've hit your weekly usage limit."},
+		{"five_hour_reserved; weekly_reserved", "You've hit your 5-hour or weekly usage limit."},
+		{"reserve_quota_unknown", "No account is currently available under the configured quota protection."},
+	}
+	for _, test := range tests {
+		t.Run(test.summary, func(t *testing.T) {
+			raw, err := quotaLimitEnvelope(test.summary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var envelope pluginabi.Envelope
+			if err := json.Unmarshal(raw, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.OK || envelope.Error == nil || envelope.Error.HTTPStatus != http.StatusTooManyRequests || envelope.Error.Code != "usage_limit_reached" {
+				t.Fatalf("unexpected plugin error: %s", raw)
+			}
+			var body struct {
+				Error struct{ Message, Type, Code string }
+			}
+			if err := json.Unmarshal([]byte(envelope.Error.Message), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Error.Message != test.message || body.Error.Type != "usage_limit_reached" || body.Error.Code != "usage_limit_reached" {
+				t.Fatalf("unexpected client error: %+v", body.Error)
+			}
+		})
+	}
+}
+
+func TestQuotaNotReadyEnvelopePreservesClientCode(t *testing.T) {
+	raw, err := quotaNotReadyEnvelope()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope pluginabi.Envelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.OK || envelope.Error == nil || envelope.Error.HTTPStatus != http.StatusServiceUnavailable || !envelope.Error.Retryable {
+		t.Fatalf("unexpected plugin error: %s", raw)
+	}
+	var body struct {
+		Error struct {
+			Type, Code string
+			Retryable  bool
+		}
+	}
+	if err := json.Unmarshal([]byte(envelope.Error.Message), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error.Code != "quota_not_ready" || body.Error.Type != "server_error" || !body.Error.Retryable {
+		t.Fatalf("unexpected client error: %+v", body.Error)
 	}
 }
