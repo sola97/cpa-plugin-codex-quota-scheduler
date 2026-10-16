@@ -23,6 +23,8 @@ func schedulerReasonText(reason string) string {
 		return "周剩余额度已达到保留阈值"
 	case "reserve_quota_unknown":
 		return "保护已开启但额度无法核实，等待额度刷新"
+	case "quota_not_ready":
+		return "CPA 候选账号的额度尚未就绪，查询失败或等待超时；这不是已确认触及保留线"
 	case "auth_failure":
 		return "账号认证失败，等待恢复"
 	case "circuit_open":

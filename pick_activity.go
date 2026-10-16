@@ -115,7 +115,9 @@ func (p *pickActivityPump) run() {
 					return
 				}
 				if p.refresher != nil {
-					p.refresher.OnSchedulerPick(intent.Request, intent.Version, intent.Now)
+					p.state.RecordCodexActivity(intent.Now)
+					_, version := p.state.CPAAdmissionVersioned()
+					p.refresher.OnSchedulerPick(intent.Request, version, intent.Now)
 				}
 			}
 		}

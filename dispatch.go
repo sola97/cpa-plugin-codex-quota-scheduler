@@ -142,6 +142,16 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
+	if pump := globalPickActivityPump.Load(); pump != nil {
+		ctx, cancel := context.WithTimeout(pump.ctx, schedulerQuotaWaitTimeout)
+		err := waitForSchedulerQuota(ctx, req, pump)
+		cancel()
+		if err != nil {
+			snapshot := publishedSchedulerSnapshot.Load()
+			observeSchedulerDecision(snapshot, req, PickDecision{Handled: true, Reject: true, Reason: "quota_not_ready", UnavailableSummary: err.Error()}, time.Now())
+			return quotaNotReadyEnvelope()
+		}
+	}
 	decision := schedulerPickPublished(req, time.Now())
 	if decision.Reject {
 		return errorEnvelope("quota_reserve_protected", "没有可选的 Codex 账号；额度保留保护已阻止内置调度回退"), nil
@@ -189,6 +199,10 @@ func logSchedulerDecision(store *PluginState, req pluginapi.SchedulerPickRequest
 		level = "warn"
 		event = "scheduler.reserve_protected"
 		message = "额度保留保护已生效：没有可选账号，禁止回退到内置调度"
+		if decision.Reason == "quota_not_ready" {
+			event = "scheduler.quota_not_ready"
+			message = "账号额度未就绪：额度查询失败或等待超时，原请求未转发，请稍后重试"
+		}
 		fields["unavailable_summary"] = decision.UnavailableSummary
 	} else if decision.DelegateBuiltin != "" {
 		event = "scheduler.fallback"
