@@ -32,6 +32,6 @@
 **Files:** `README.zh-CN.md`, this plan and a deployment record.
 
 - [x] Document why the pre-reset refusal was correct but weekly reserve handling was not.
-- [ ] Commit and push the fix.
-- [ ] Deploy the exact tested library to NUC with backup and shared-network sidecar restart, then use the existing synchronizer for Bandwagon.
-- [ ] Verify both hosts' window kinds remain correct after real traffic, settings unchanged and weekly-exhausted accounts still excluded; record results and push docs.
+- [x] Commit and push the fix: `51a74ef`.
+- [x] Deploy the exact tested library to NUC with backup and shared-network sidecar restart, then use the existing synchronizer for Bandwagon. Both registered `0.3.2-sola97.weeklywindow`; SHA256 matched.
+- [x] Verify both hosts' window kinds remain correct after real traffic, settings unchanged and weekly-exhausted accounts still excluded. Recorded in `docs/deployments/2026-10-17-observed-weekly-reserve.md`.
