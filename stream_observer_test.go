@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +10,119 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
+
+func TestObservedQuotaIndependentWindows(t *testing.T) {
+	now := time.Now()
+	for _, transport := range []string{"sse", "headers"} {
+		for _, test := range []struct {
+			name         string
+			five, weekly float64
+			limited      bool
+			want         string
+		}{
+			{"weekly_reserve", 21, 98, false, "weekly_reserved"},
+			{"five_hour_reserve", 88, 21, false, "five_hour_reserved"},
+			{"weekly_exhausted", 21, 100, true, "weekly_exhausted"},
+			{"five_hour_exhausted", 100, 21, true, "five_hour_exhausted"},
+		} {
+			t.Run(transport+"/"+test.name, func(t *testing.T) {
+				store := NewPluginState(DefaultConfig())
+				account := reserveTestAccount(now, 20, 20)
+				account.Annotation.FiveHourReservePercent = 12
+				account.Annotation.WeeklyReservePercent = 2
+				if test.limited {
+					account.Annotation.QuotaReserveEnabled = false
+				}
+				store.UpsertQuota(account)
+				if transport == "sse" {
+					frame := fmt.Sprintf(`data: {"rate_limits":{"allowed":%t,"limit_reached":%t,"primary":{"used_percent":%g,"window_minutes":300,"reset_after_seconds":7200},"secondary":{"used_percent":%g,"window_minutes":10080,"reset_after_seconds":86400}}}`, !test.limited, test.limited, test.five, test.weekly)
+					applyObservedRateLimits(store, account.AuthID, "", []byte(frame), now)
+				} else {
+					applyObservedCodexHeaders(store, pluginapi.UsageRecord{Provider: "codex", AuthID: account.AuthID,
+						ResponseHeaders: map[string][]string{
+							"X-Codex-Allowed": {fmt.Sprint(!test.limited)}, "X-Codex-Limit-Reached": {fmt.Sprint(test.limited)},
+							"X-Codex-Primary-Used-Percent": {fmt.Sprint(test.five)}, "X-Codex-Primary-Window-Minutes": {"300"}, "X-Codex-Primary-Reset-After-Seconds": {"7200"},
+							"X-Codex-Secondary-Used-Percent": {fmt.Sprint(test.weekly)}, "X-Codex-Secondary-Window-Minutes": {"10080"}, "X-Codex-Secondary-Reset-After-Seconds": {"86400"},
+						}}, now)
+				}
+				account = accountByAuthID(t, store.Snapshot(now), account.AuthID)
+				if account.Quota.FiveHour.Kind != WindowFiveHour || account.Quota.LongWindow.Kind != WindowWeekly {
+					t.Errorf("window kinds lost during observation: five=%q weekly=%q", account.Quota.FiveHour.Kind, account.Quota.LongWindow.Kind)
+				}
+				if account.Quota.FiveHour.Exhausted != (test.five >= 100) || account.Quota.LongWindow.Exhausted != (test.weekly >= 100) {
+					t.Errorf("exhaustion leaked between windows: five=%v weekly=%v", account.Quota.FiveHour.Exhausted, account.Quota.LongWindow.Exhausted)
+				}
+				view := accountViewFromState(account, store.Config(), now, nil)
+				if reason := accountExclusionReason(view, now); reason != test.want {
+					t.Errorf("exclusion reason=%q, want %q", reason, test.want)
+				}
+				if !test.limited && ClassifyAccount(view, now) != Excluded {
+					t.Fatal("observed quota bypassed the configured reserve")
+				}
+				if !test.limited {
+					snapshot := store.Snapshot(now)
+					snapshot.CPAAdmission = CPAAdmissionState{Observed: true, AuthIDs: map[string]struct{}{account.AuthID: {}}}
+					req := pluginapi.SchedulerPickRequest{Provider: "codex", Candidates: []pluginapi.SchedulerAuthCandidate{{ID: account.AuthID, Provider: "codex"}}}
+					if decision := PickCodexAccount(req, snapshot, now); !decision.Reject || decision.AuthID != "" {
+						t.Fatalf("observed reserve did not reject scheduler request: %#v", decision)
+					}
+					text := quotaReserveExplanation(accountReservationState(account), now)
+					if test.want == "weekly_reserved" && (!strings.Contains(text, "剩余 2.00% ≤ 生效保留 2%") || strings.Contains(text, "没有周额度窗口")) {
+						t.Fatalf("weekly reserve explanation lost: %s", text)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestObservedWindowClassificationAndPartialMerge(t *testing.T) {
+	now := time.Now()
+	for _, test := range []struct {
+		name, minutes string
+		kind          WindowKind
+		family        AccountFamily
+	}{
+		{"weekly", "10080", WindowWeekly, AccountFamilyWeekly},
+		{"weekly_without_duration", "", WindowWeekly, AccountFamilyWeekly},
+		{"weekly_nonstandard_duration", "20160", WindowWeekly, AccountFamilyWeekly},
+		{"monthly_minimum", "40320", WindowMonthly, AccountFamilyMonthly},
+		{"monthly", "43200", WindowMonthly, AccountFamilyMonthly},
+		{"monthly_maximum", "44640", WindowMonthly, AccountFamilyMonthly},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := NewPluginState(DefaultConfig())
+			original := reserveTestAccount(now, 20, 30)
+			store.UpsertQuota(original)
+			duration := ""
+			if test.minutes != "" {
+				duration = `,"window_minutes":` + test.minutes
+			}
+			frame := `data: {"rate_limits":{"secondary":{"used_percent":40,"reset_after_seconds":86400` + duration + `}}}`
+			applyObservedRateLimits(store, original.AuthID, "", []byte(frame), now)
+			account := accountByAuthID(t, store.Snapshot(now), original.AuthID)
+			if account.Quota.LongWindow.Kind != test.kind || account.Family != test.family {
+				t.Fatalf("SSE classification: kind=%q family=%q", account.Quota.LongWindow.Kind, account.Family)
+			}
+			if *account.Quota.FiveHour.UsedPercent != 20 || !account.Quota.FiveHour.ResetAt.Equal(original.Quota.FiveHour.ResetAt) {
+				t.Fatal("secondary-only observation changed the 5-hour window")
+			}
+			headers := map[string][]string{"X-Codex-Secondary-Used-Percent": {"40"}, "X-Codex-Secondary-Reset-After-Seconds": {"86400"}}
+			if test.minutes != "" {
+				headers["X-Codex-Secondary-Window-Minutes"] = []string{test.minutes}
+			}
+			quota, ok := codexQuotaFromHeaders(headers, now)
+			if !ok || quota.LongWindow.Kind != test.kind || quota.Family != test.family {
+				t.Fatalf("header classification: %#v", quota)
+			}
+			applyObservedRateLimits(store, original.AuthID, "", []byte(`data: {"rate_limits":{"primary":{"used_percent":50,"window_minutes":300,"reset_after_seconds":3600}}}`), now.Add(time.Second))
+			account = accountByAuthID(t, store.Snapshot(now.Add(time.Second)), original.AuthID)
+			if account.Quota.LongWindow.Kind != test.kind || *account.Quota.LongWindow.UsedPercent != 40 || account.Family != test.family {
+				t.Fatal("primary-only observation changed the long window")
+			}
+		})
+	}
+}
 
 func TestStreamObserverFramesRateLimitsAcrossChunkSplits(t *testing.T) {
 	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)

@@ -172,12 +172,12 @@ func applyObservedRateLimits(store *PluginState, authID, authIndex string, frame
 		return
 	}
 	quota := ParsedQuota{}
-	if window := observedQuotaWindow(event.RateLimits.Primary, event.RateLimits, now); window != nil {
+	if window := observedQuotaWindow(event.RateLimits.Primary, now, 0); window != nil {
 		quota.FiveHour = window
 	}
-	if window := observedQuotaWindow(event.RateLimits.Secondary, event.RateLimits, now); window != nil {
+	if window := observedQuotaWindow(event.RateLimits.Secondary, now, 1); window != nil {
 		quota.LongWindow = window
-		quota.Family = familyForWindowMinutes(window.LimitWindowSeconds)
+		quota.Family = familyForObservedWindow(window)
 	}
 	if quota.FiveHour == nil && quota.LongWindow == nil {
 		return
@@ -198,11 +198,14 @@ func sseEventData(frame []byte) []byte {
 	return nil
 }
 
-func observedQuotaWindow(window *codexRateLimitWindow, limits *codexRateLimitsPayload, now time.Time) *QuotaWindow {
+func observedQuotaWindow(window *codexRateLimitWindow, now time.Time, order int) *QuotaWindow {
 	if window == nil || window.UsedPercent == nil {
 		return nil
 	}
-	out := &QuotaWindow{UsedPercent: window.UsedPercent}
+	out := &QuotaWindow{Kind: WindowFiveHour, UsedPercent: window.UsedPercent}
+	if order == 1 {
+		out.Kind = WindowWeekly
+	}
 	if window.WindowMinutes != nil && *window.WindowMinutes > 0 {
 		seconds := int64(*window.WindowMinutes * 60)
 		out.LimitWindowSeconds = &seconds
@@ -217,22 +220,22 @@ func observedQuotaWindow(window *codexRateLimitWindow, limits *codexRateLimitsPa
 		// Without a reset deadline the observation cannot drive scheduling.
 		return nil
 	}
-	if (limits.Allowed != nil && !*limits.Allowed) || (limits.LimitReached != nil && *limits.LimitReached) || *window.UsedPercent >= 100 {
+	// The envelope can be limited by the other window; this percentage is local.
+	if *window.UsedPercent >= 100 {
 		out.Exhausted = true
 	}
+	classifyWindow(out, order)
 	return out
 }
 
-func familyForWindowMinutes(seconds *int64) AccountFamily {
-	if seconds == nil {
-		return ""
-	}
-	const weekSeconds = int64(7 * 24 * time.Hour / time.Second)
-	switch {
-	case *seconds <= weekSeconds:
+func familyForObservedWindow(window *QuotaWindow) AccountFamily {
+	switch window.Kind {
+	case WindowWeekly:
 		return AccountFamilyWeekly
-	default:
+	case WindowMonthly:
 		return AccountFamilyMonthly
+	default:
+		return ""
 	}
 }
 
@@ -286,22 +289,18 @@ func codexQuotaFromHeaders(headers map[string][]string, now time.Time) (ParsedQu
 		}
 		return ""
 	}
-	allowed := get("X-Codex-Allowed")
-	limitReached := get("X-Codex-Limit-Reached")
-	limited := allowed == "false" || limitReached == "true"
-
 	quota := ParsedQuota{}
-	if window := quotaWindowFromHeaders(get, "X-Codex-Primary", limited, now); window != nil {
+	if window := quotaWindowFromHeaders(get, "X-Codex-Primary", now, 0); window != nil {
 		quota.FiveHour = window
 	}
-	if window := quotaWindowFromHeaders(get, "X-Codex-Secondary", limited, now); window != nil {
+	if window := quotaWindowFromHeaders(get, "X-Codex-Secondary", now, 1); window != nil {
 		quota.LongWindow = window
-		quota.Family = familyForWindowMinutes(window.LimitWindowSeconds)
+		quota.Family = familyForObservedWindow(window)
 	}
 	return quota, quota.FiveHour != nil || quota.LongWindow != nil
 }
 
-func quotaWindowFromHeaders(get func(string) string, prefix string, limited bool, now time.Time) *QuotaWindow {
+func quotaWindowFromHeaders(get func(string) string, prefix string, now time.Time, order int) *QuotaWindow {
 	usedText := get(prefix + "-Used-Percent")
 	if usedText == "" {
 		return nil
@@ -310,7 +309,10 @@ func quotaWindowFromHeaders(get func(string) string, prefix string, limited bool
 	if err != nil || used < 0 || used > 100 {
 		return nil
 	}
-	window := &QuotaWindow{UsedPercent: &used}
+	window := &QuotaWindow{Kind: WindowFiveHour, UsedPercent: &used}
+	if order == 1 {
+		window.Kind = WindowWeekly
+	}
 	if minutesText := get(prefix + "-Window-Minutes"); minutesText != "" {
 		if minutes, err := strconv.ParseFloat(minutesText, 64); err == nil && minutes > 0 {
 			seconds := int64(minutes * 60)
@@ -332,8 +334,9 @@ func quotaWindowFromHeaders(get func(string) string, prefix string, limited bool
 	if window.ResetAt.IsZero() {
 		return nil
 	}
-	if limited || used >= 100 {
+	if used >= 100 {
 		window.Exhausted = true
 	}
+	classifyWindow(window, order)
 	return window
 }

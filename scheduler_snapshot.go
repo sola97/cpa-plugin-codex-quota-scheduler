@@ -189,6 +189,17 @@ func accountExclusionReason(a AccountView, now time.Time) string {
 	case a.Trial != TrialNone:
 		return "trial_pending"
 	case a.Exhausted && (a.ResetAt.IsZero() || a.ResetAt.After(now)):
+		if windowExhausted(a.Reservation.LongWindow, now) {
+			if a.Reservation.LongWindow.Kind == WindowWeekly {
+				return "weekly_exhausted"
+			}
+			if a.Reservation.LongWindow.Kind == WindowMonthly {
+				return "monthly_exhausted"
+			}
+		}
+		if windowExhausted(a.Reservation.FiveHour, now) {
+			return "five_hour_exhausted"
+		}
 		return "window_exhausted"
 	case a.Cache == CacheStale && !a.LastKnownAvailable:
 		return "stale_quota"

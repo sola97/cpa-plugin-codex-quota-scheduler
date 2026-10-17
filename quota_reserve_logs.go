@@ -35,7 +35,13 @@ func schedulerReasonText(reason string) string {
 		return "账号暂时额度耗尽，尚未到恢复时间"
 	case "trial_pending":
 		return "账号已有恢复试用请求，等待验证结果"
-	case "window_exhausted", "five_hour_exhausted", "long_window_exhausted", "weekly_exhausted", "monthly_exhausted":
+	case "five_hour_exhausted":
+		return "5 小时额度已耗尽，等待该窗口重置和新额度验证"
+	case "weekly_exhausted":
+		return "周额度已耗尽，等待周窗口重置和新额度验证；5 小时窗口仍独立判定"
+	case "monthly_exhausted":
+		return "月额度已耗尽，等待月窗口重置和新额度验证"
+	case "window_exhausted", "long_window_exhausted":
 		return "额度窗口已耗尽，等待重置和新额度验证"
 	case "stale_quota":
 		return "额度缓存已过期且没有可用证据"
